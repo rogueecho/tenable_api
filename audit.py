@@ -442,7 +442,9 @@ class SecurityCenterAuditor:
 
         for cidr in scope_cfg.get("cidrs", []):
             nets = parse_ip_entry(cidr)
-            if nets and not network_overlaps_scope(nets[0], all_zone_nets):
+            # A CIDR or dash-range may expand to multiple networks; check all
+            # of them — flagging only when none overlaps any zone.
+            if nets and not any(network_overlaps_scope(n, all_zone_nets) for n in nets):
                 issues.append(ScopeIssue(
                     "uncovered_scope", cidr, "",
                     f"{cidr} has no overlap with any scan zone — "
@@ -453,7 +455,7 @@ class SecurityCenterAuditor:
             if is_hostname(entry):
                 continue  # handled in hostname block below
             nets = parse_ip_entry(entry)
-            if nets and not network_overlaps_scope(nets[0], all_zone_nets):
+            if nets and not any(network_overlaps_scope(n, all_zone_nets) for n in nets):
                 issues.append(ScopeIssue(
                     "uncovered_scope", entry, "",
                     f"{entry} is not covered by any scan zone",

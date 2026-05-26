@@ -139,7 +139,7 @@ class SecurityCenterClient:
         body = resp.json()
         if body.get("type") == "error":
             raise RuntimeError(
-                f"API error [{path}]: {body.get('error_code')} – {body.get('error_msg')}"
+                f"API error [{path}]: {body.get('error_code')} - {body.get('error_msg')}"
             )
         return body.get("response", body)
 
@@ -519,6 +519,9 @@ class SecurityCenterClient:
                 dest_path="vulns.csv",
             )
         """
+        # startOffset/endOffset are required by the API.  Set endOffset to a
+        # value large enough to cover any realistic result set so the caller
+        # receives the complete dataset without needing to paginate manually.
         payload: dict[str, Any] = {
             "type":        analysis_type,
             "query":       query,
@@ -526,7 +529,7 @@ class SecurityCenterClient:
             "sortField":   sort_field,
             "sortDir":     sort_dir,
             "startOffset": 0,
-            "endOffset":   PAGE_SIZE,
+            "endOffset":   2_000_000_000,
             "columns":     columns,
         }
         if scan_id is not None:
