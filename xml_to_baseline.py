@@ -5,8 +5,7 @@ Converts an XML Security Center configuration export into a YAML baseline
 compatible with audit.py.
 
 Only the config_checks section is generated.  The scope block (IPs, CIDRs,
-hostnames) must be added to the output file manually — a commented-out
-template is appended to every generated file as a reminder.
+hostnames) must be added to the output file manually.
 
 Two XML input styles are supported and may be mixed in the same file:
 
@@ -31,27 +30,18 @@ Type inference
 --------------
 Each field value is classified automatically:
   boolean  – value is "true" or "false" (case-insensitive)
-  numeric  – value can be parsed as a float
+  numeric  – value can be parsed as a float; always written as an exact-match
+             check (expected: <value>).  To express a range check, manually
+             edit the output YAML and replace 'expected' with 'min' and/or
+             'max' (either bound may be omitted for one-sided ranges):
+               config.sessionTimeout:
+                 type: numeric
+                 max: 259200    # must complete within 72 hours (seconds)
   string   – everything else
-
-Numeric tolerance (--tolerance)
---------------------------------
-Without --tolerance, numeric fields are written as exact-match checks:
-  config.sessionTimeout:
-    type: numeric
-    expected: 30
-
-With --tolerance 20% or --tolerance 5 (flat), a min/max range is produced:
-  config.sessionTimeout:
-    type: numeric
-    min: 24        # 30 - 20%
-    max: 36        # 30 + 20%
 
 Usage:
     python xml_to_baseline.py sample_config.xml
     python xml_to_baseline.py sample_config.xml --out prod_baseline.yaml
-    python xml_to_baseline.py sample_config.xml --tolerance 20%
-    python xml_to_baseline.py sample_config.xml --tolerance 5
     python xml_to_baseline.py sample_config.xml --exclude smtpHost,smtpFromAddress
     python xml_to_baseline.py sample_config.xml --description "Q3 2026 baseline"
 """
@@ -87,28 +77,6 @@ KNOWN_SECTIONS: set[str] = {
 STRUCTURAL_TAGS: set[str] = {"Scope", "Metadata", "Settings", "SecurityCenterConfig"}
 
 
-# ── Tolerance parsing ─────────────────────────────────────────────────────────
-
-def parse_tolerance(raw: str) -> tuple[str, float]:
-    """Parse a tolerance string into (kind, amount).
-
-    Accepts:
-        "20%"  → ("percent", 20.0)
-        "5"    → ("flat",    5.0)
-        "2.5"  → ("flat",    2.5)
-
-    Raises:
-        ValueError for unrecognisable formats.
-    """
-    raw = raw.strip()
-    if raw.endswith("%"):
-        pct = float(raw[:-1])
-        if not (0 < pct < 100):
-            raise ValueError(f"Percentage tolerance must be between 0 and 100, got {pct}")
-        return ("percent", pct)
-    return ("flat", float(raw))
-
-
 # ── Numeric helpers ───────────────────────────────────────────────────────────
 
 def _as_int_or_float(n: float) -> int | float:
@@ -116,44 +84,14 @@ def _as_int_or_float(n: float) -> int | float:
     return int(n) if n == int(n) else n
 
 
-def build_numeric_spec(
-    value: float,
-    tolerance: tuple[str, float] | None,
-) -> dict:
-    """Build the numeric spec dict for one field value.
-
-    Without tolerance → exact match.
-    With tolerance    → [min, max] range derived from the known-good value.
-    """
-    if tolerance is None:
-        return {"type": "numeric", "expected": _as_int_or_float(value)}
-
-    kind, amount = tolerance
-    if kind == "percent":
-        lo = value * (1.0 - amount / 100.0)
-        hi = value * (1.0 + amount / 100.0)
-    else:
-        lo = value - amount
-        hi = value + amount
-
-    return {
-        "type": "numeric",
-        "min": _as_int_or_float(round(lo, 6)),
-        "max": _as_int_or_float(round(hi, 6)),
-    }
-
-
 # ── Type inference ────────────────────────────────────────────────────────────
 
-def infer_spec(
-    value: str,
-    tolerance: tuple[str, float] | None,
-) -> dict:
+def infer_spec(value: str) -> dict:
     """Infer the baseline spec dict for a raw string value.
 
     Priority:
       1. Boolean  – "true" / "false" (case-insensitive)
-      2. Numeric  – parseable as float
+      2. Numeric  – parseable as float; written as exact-match (expected: X)
       3. String   – everything else
     """
     stripped = value.strip()
@@ -162,7 +100,7 @@ def infer_spec(
         return {"type": "boolean", "expected": stripped.lower() == "true"}
 
     try:
-        return build_numeric_spec(float(stripped), tolerance)
+        return {"type": "numeric", "expected": _as_int_or_float(float(stripped))}
     except ValueError:
         pass
 
@@ -179,18 +117,14 @@ class XmlToBaselineConverter:
 
     def __init__(
         self,
-        tolerance: tuple[str, float] | None = None,
-        exclude:   set[str] | None = None,
+        exclude: set[str] | None = None,
     ) -> None:
         """
         Args:
-            tolerance: Optional (kind, amount) for numeric fields.
-                       See parse_tolerance().
-            exclude:   Set of bare field names to omit from config_checks
-                       (e.g. {"smtpHost", "smtpFromAddress"}).
+            exclude: Set of bare field names to omit from config_checks
+                     (e.g. {"smtpHost", "smtpFromAddress"}).
         """
-        self._tolerance = tolerance
-        self._exclude   = exclude or set()
+        self._exclude = exclude or set()
 
     # ── Public entry point ────────────────────────────────────────────────
 
@@ -254,7 +188,7 @@ class XmlToBaselineConverter:
                 continue
 
             key = f"{section_name}.{name}"
-            out[key] = infer_spec(value, self._tolerance)
+            out[key] = infer_spec(value)
 
     def _parse_settings_block(
         self,
@@ -282,7 +216,7 @@ class XmlToBaselineConverter:
         key = f"{section}.{name}"
         # Don't overwrite a richer nested-section entry with a flat one.
         if key not in out:
-            out[key] = infer_spec(value, self._tolerance)
+            out[key] = infer_spec(value)
 
     # ── Metadata ──────────────────────────────────────────────────────────
 
@@ -363,8 +297,8 @@ def write_baseline(baseline: dict, dest: Path) -> None:
     """Write the baseline dict to dest as YAML with a header comment."""
     header = (
         "# Generated by xml_to_baseline.py - review before use in audit.py\n"
-        "# Fields with type: numeric and exact 'expected' values were inferred\n"
-        "# from the known-good config.  Add min/max or --tolerance to widen them.\n\n"
+        "# Numeric fields use exact-match 'expected' by default.  To express a\n"
+        "# range, replace 'expected' with 'min' and/or 'max' in this file.\n\n"
     )
     dest.write_text(header + _build_yaml_str(baseline), encoding="utf-8")
 
@@ -400,15 +334,6 @@ def main() -> None:
         ),
     )
     parser.add_argument(
-        "--tolerance", "-t",
-        default=None,
-        help=(
-            "Allowed variance for numeric fields.  Use a percentage (e.g. 20%%) "
-            "or a flat value (e.g. 5).  Without this flag, numeric fields are "
-            "written as exact-match checks."
-        ),
-    )
-    parser.add_argument(
         "--exclude", "-e",
         default="",
         help=(
@@ -434,16 +359,9 @@ def main() -> None:
         else xml_path.with_name(xml_path.stem + "_baseline.yaml")
     )
 
-    tolerance = None
-    if args.tolerance:
-        try:
-            tolerance = parse_tolerance(args.tolerance)
-        except ValueError as exc:
-            sys.exit(f"Error: invalid --tolerance value: {exc}")
-
     exclude = {f.strip() for f in args.exclude.split(",") if f.strip()}
 
-    converter = XmlToBaselineConverter(tolerance=tolerance, exclude=exclude)
+    converter = XmlToBaselineConverter(exclude=exclude)
 
     try:
         baseline = converter.convert(xml_path)
@@ -459,10 +377,6 @@ def main() -> None:
 
     print(f"Converted: {xml_path}  ->  {out_path}")
     print(f"  config checks : {n_checks}")
-    if tolerance:
-        kind, amount = tolerance
-        label = f"{amount}%" if kind == "percent" else str(amount)
-        print(f"  tolerance     : {label} ({kind})")
     if exclude:
         print(f"  excluded      : {', '.join(sorted(exclude))}")
 
