@@ -1,0 +1,543 @@
+"""
+xml_to_baseline.py
+------------------
+Converts an XML Security Center configuration export into a YAML baseline
+compatible with audit.py.
+
+Two XML input styles are supported and may be mixed in the same file:
+
+  1. Nested section elements  (preferred)
+     Section tag names must match collect_config_report() keys:
+       config | system_info | status | current_user | ip_info
+
+     <config>
+       <sessionTimeout>30</sessionTimeout>
+       <ldapEnabled>true</ldapEnabled>
+     </config>
+     <system_info>
+       <licenseStatus>Valid</licenseStatus>
+     </system_info>
+
+  2. Flat <Setting> attributes
+     <Setting name="sessionTimeout" value="30" section="config"/>
+
+  Scope block (IPs/CIDRs/hostnames for scan boundary checks):
+     <Scope>
+       <CIDRs>
+         <CIDR>192.168.0.0/16</CIDR>
+       </CIDRs>
+       <Hosts>
+         <Host>192.168.1.50</Host>
+         <Host>server01.corp.example.com</Host>
+       </Hosts>
+     </Scope>
+
+  See sample_config.xml for a complete example.
+
+Type inference
+--------------
+Each field value is classified automatically:
+  boolean  – value is "true" or "false" (case-insensitive)
+  numeric  – value can be parsed as a float
+  string   – everything else
+
+Numeric tolerance (--tolerance)
+--------------------------------
+Without --tolerance, numeric fields are written as exact-match checks:
+  config.sessionTimeout:
+    type: numeric
+    expected: 30
+
+With --tolerance 20% or --tolerance 5 (flat), a min/max range is produced:
+  config.sessionTimeout:
+    type: numeric
+    min: 24        # 30 - 20%
+    max: 36        # 30 + 20%
+
+Usage:
+    python xml_to_baseline.py sample_config.xml
+    python xml_to_baseline.py sample_config.xml --out prod_baseline.yaml
+    python xml_to_baseline.py sample_config.xml --tolerance 20%
+    python xml_to_baseline.py sample_config.xml --tolerance 5
+    python xml_to_baseline.py sample_config.xml --exclude smtpHost,smtpFromAddress
+    python xml_to_baseline.py sample_config.xml --description "Q3 2026 baseline"
+"""
+
+import argparse
+import ipaddress
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+
+# Section tag names that map to collect_config_report() keys.
+# Tags with these names are treated as config sections; all other
+# capitalised tags (Scope, Metadata, Settings) are handled separately.
+KNOWN_SECTIONS: set[str] = {
+    "config",
+    "system_info",
+    "status",
+    "current_user",
+    "ip_info",
+    "scanners",
+    "repositories",
+    "scan_zones",
+    "organizations",
+}
+
+# Tags that are structural, not config sections.
+STRUCTURAL_TAGS: set[str] = {"Scope", "Metadata", "Settings", "SecurityCenterConfig"}
+
+
+# ── Tolerance parsing ─────────────────────────────────────────────────────────
+
+def parse_tolerance(raw: str) -> tuple[str, float]:
+    """Parse a tolerance string into (kind, amount).
+
+    Accepts:
+        "20%"  → ("percent", 20.0)
+        "5"    → ("flat",    5.0)
+        "2.5"  → ("flat",    2.5)
+
+    Raises:
+        ValueError for unrecognisable formats.
+    """
+    raw = raw.strip()
+    if raw.endswith("%"):
+        pct = float(raw[:-1])
+        if not (0 < pct < 100):
+            raise ValueError(f"Percentage tolerance must be between 0 and 100, got {pct}")
+        return ("percent", pct)
+    return ("flat", float(raw))
+
+
+# ── IP classification ─────────────────────────────────────────────────────────
+
+def classify_host_entry(value: str) -> str:
+    """Return "cidr", "ip", or "hostname" for a given string."""
+    value = value.strip()
+    try:
+        net = ipaddress.IPv4Network(value, strict=False)
+        return "cidr" if net.prefixlen < 32 else "ip"
+    except ValueError:
+        # Check for dash range — treat as a CIDR-like scope entry.
+        if "-" in value:
+            parts = value.split("-", 1)
+            try:
+                ipaddress.IPv4Address(parts[0].strip())
+                ipaddress.IPv4Address(parts[1].strip())
+                return "cidr"
+            except (ipaddress.AddressValueError, ValueError):
+                pass
+        return "hostname"
+
+
+# ── Numeric helpers ───────────────────────────────────────────────────────────
+
+def _as_int_or_float(n: float) -> int | float:
+    """Return n as int when it is a whole number, otherwise as float."""
+    return int(n) if n == int(n) else n
+
+
+def build_numeric_spec(
+    value: float,
+    tolerance: tuple[str, float] | None,
+) -> dict:
+    """Build the numeric spec dict for one field value.
+
+    Without tolerance → exact match.
+    With tolerance    → [min, max] range derived from the known-good value.
+    """
+    if tolerance is None:
+        return {"type": "numeric", "expected": _as_int_or_float(value)}
+
+    kind, amount = tolerance
+    if kind == "percent":
+        lo = value * (1.0 - amount / 100.0)
+        hi = value * (1.0 + amount / 100.0)
+    else:
+        lo = value - amount
+        hi = value + amount
+
+    return {
+        "type": "numeric",
+        "min": _as_int_or_float(round(lo, 6)),
+        "max": _as_int_or_float(round(hi, 6)),
+    }
+
+
+# ── Type inference ────────────────────────────────────────────────────────────
+
+def infer_spec(
+    value: str,
+    tolerance: tuple[str, float] | None,
+) -> dict:
+    """Infer the baseline spec dict for a raw string value.
+
+    Priority:
+      1. Boolean  – "true" / "false" (case-insensitive)
+      2. Numeric  – parseable as float
+      3. String   – everything else
+    """
+    stripped = value.strip()
+
+    if stripped.lower() in ("true", "false"):
+        return {"type": "boolean", "expected": stripped.lower() == "true"}
+
+    try:
+        return build_numeric_spec(float(stripped), tolerance)
+    except ValueError:
+        pass
+
+    return {"type": "string", "expected": stripped}
+
+
+# ── XML parser / converter ────────────────────────────────────────────────────
+
+class XmlToBaselineConverter:
+    """Parses a Security Center XML config and produces a baseline dict.
+
+    The returned dict is directly serialisable to YAML that audit.py accepts.
+    """
+
+    def __init__(
+        self,
+        tolerance: tuple[str, float] | None = None,
+        exclude:   set[str] | None = None,
+    ) -> None:
+        """
+        Args:
+            tolerance: Optional (kind, amount) for numeric fields.
+                       See parse_tolerance().
+            exclude:   Set of bare field names to omit from config_checks
+                       (e.g. {"smtpHost", "smtpFromAddress"}).
+        """
+        self._tolerance = tolerance
+        self._exclude   = exclude or set()
+
+    # ── Public entry point ────────────────────────────────────────────────
+
+    def convert(self, xml_path: Path) -> dict[str, Any]:
+        """Parse xml_path and return the baseline dict.
+
+        Raises:
+            ET.ParseError  on malformed XML.
+            FileNotFoundError if the path does not exist.
+        """
+        try:
+            tree = ET.parse(xml_path)
+        except ET.ParseError as exc:
+            raise ET.ParseError(f"Malformed XML in {xml_path}: {exc}") from exc
+
+        root = tree.getroot()
+
+        config_checks: dict[str, dict] = {}
+        scope: dict[str, list[str]] = {"cidrs": [], "ips": [], "hostnames": []}
+
+        for child in root:
+            tag = child.tag
+
+            if tag == "Scope":
+                self._parse_scope(child, scope)
+            elif tag == "Metadata":
+                pass  # used only for description extraction below
+            elif tag == "Settings":
+                # Flat <Setting name="..." value="..." section="..."/> block
+                self._parse_settings_block(child, config_checks)
+            elif tag in KNOWN_SECTIONS or tag.islower():
+                # Nested section element whose tag is a SC report section name
+                self._parse_section(child, tag, config_checks)
+            # Unrecognised capitalised tags are silently skipped so the
+            # converter stays forward-compatible with new XML elements.
+
+        # Flat <Setting> elements that appear directly under root
+        # (some exporters omit the <Settings> wrapper).
+        for setting in root.iter("Setting"):
+            if setting in root:  # only direct children, not nested
+                self._parse_single_setting(setting, config_checks)
+
+        # Remove scope lists that are empty to keep the YAML tidy.
+        scope = {k: v for k, v in scope.items() if v}
+
+        return {
+            "version":      "1.0",
+            "description":  self._extract_description(root),
+            "config_checks": config_checks,
+            "scope":        scope,
+        }
+
+    # ── Section parsers ───────────────────────────────────────────────────
+
+    def _parse_section(
+        self,
+        element: ET.Element,
+        section_name: str,
+        out: dict,
+    ) -> None:
+        """Extract direct child elements as field → spec entries."""
+        for field_elem in element:
+            name  = field_elem.tag.strip()
+            value = (field_elem.text or "").strip()
+
+            if not value or name in self._exclude:
+                continue
+
+            key = f"{section_name}.{name}"
+            out[key] = infer_spec(value, self._tolerance)
+
+    def _parse_settings_block(
+        self,
+        settings_elem: ET.Element,
+        out: dict,
+    ) -> None:
+        """Handle a <Settings> wrapper containing <Setting> children."""
+        for child in settings_elem:
+            if child.tag == "Setting":
+                self._parse_single_setting(child, out)
+
+    def _parse_single_setting(
+        self,
+        elem: ET.Element,
+        out: dict,
+    ) -> None:
+        """Extract one <Setting name="X" value="Y" section="Z"/> element."""
+        name    = (elem.get("name") or "").strip()
+        value   = (elem.get("value") or "").strip()
+        section = (elem.get("section") or "config").strip()
+
+        if not name or not value or name in self._exclude:
+            return
+
+        key = f"{section}.{name}"
+        # Don't overwrite a richer nested-section entry with a flat one.
+        if key not in out:
+            out[key] = infer_spec(value, self._tolerance)
+
+    # ── Scope parser ──────────────────────────────────────────────────────
+
+    def _parse_scope(
+        self,
+        scope_elem: ET.Element,
+        scope: dict[str, list[str]],
+    ) -> None:
+        """Populate the scope dict from a <Scope> element.
+
+        Accepts two grouping conventions:
+          <CIDRs><CIDR>…</CIDR></CIDRs>
+          <Hosts><Host>…</Host></Hosts>  (or <IPs><IP>…</IP></IPs>)
+
+        classify_host_entry() determines the final bucket regardless of which
+        grouping tag was used — a /32 in <CIDRs> still lands in "ips", and a
+        CIDR in <Hosts> still lands in "cidrs".  Unresolvable values go to
+        "hostnames".
+        """
+        # Map classify_host_entry() return values to scope dict keys.
+        bucket = {"cidr": "cidrs", "ip": "ips", "hostname": "hostnames"}
+
+        for group in scope_elem:
+            for item in group:
+                value = (item.text or "").strip()
+                if not value:
+                    continue
+                kind = classify_host_entry(value)
+                scope[bucket[kind]].append(value)
+
+    # ── Metadata ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_description(root: ET.Element) -> str:
+        """Return the description from <Metadata><Description>, root attributes,
+        or a sensible fallback."""
+        # <Metadata><Description>…</Description></Metadata>
+        meta = root.find("Metadata")
+        if meta is not None:
+            desc = meta.findtext("Description")
+            if desc and desc.strip():
+                return desc.strip()
+
+        # host attribute on the root element
+        host = root.get("host")
+        exported = root.get("exported", "")
+        if host:
+            suffix = f" exported {exported}" if exported else ""
+            return f"Baseline for {host}{suffix}"
+
+        return "Converted from XML — review and annotate before use"
+
+
+# ── YAML serialisation ────────────────────────────────────────────────────────
+
+class _QuotedStr(str):
+    """Marker class so the YAML dumper emits quoted strings."""
+
+
+def _quoted_str_representer(dumper: yaml.Dumper, data: _QuotedStr) -> yaml.ScalarNode:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
+
+
+def _build_yaml_str(baseline: dict) -> str:
+    """Serialise the baseline dict to a YAML string.
+
+    String expected/description values are wrapped in _QuotedStr so they
+    are emitted with double-quotes (matching the hand-authored baseline style).
+    Boolean and numeric values use YAML native types.
+    """
+    # Quote strings in config_checks.
+    quoted_checks: dict[str, Any] = {}
+    for key, spec in baseline.get("config_checks", {}).items():
+        new_spec = dict(spec)
+        if spec.get("type") == "string":
+            new_spec["expected"] = _QuotedStr(spec["expected"])
+        quoted_checks[key] = new_spec
+
+    # Quote strings in scope lists.
+    def quote_list(lst: list[str]) -> list[_QuotedStr]:
+        return [_QuotedStr(v) for v in lst]
+
+    raw_scope = baseline.get("scope", {})
+    quoted_scope: dict[str, Any] = {
+        k: quote_list(v) for k, v in raw_scope.items()
+    }
+
+    out = {
+        "version":       _QuotedStr(str(baseline["version"])),
+        "description":   _QuotedStr(baseline["description"]),
+        "config_checks": quoted_checks,
+        "scope":         quoted_scope,
+    }
+
+    dumper = yaml.Dumper
+    dumper.add_representer(_QuotedStr, _quoted_str_representer)
+
+    return yaml.dump(
+        out,
+        Dumper=dumper,
+        default_flow_style=False,
+        allow_unicode=True,
+        sort_keys=False,
+        width=88,
+    )
+
+
+def write_baseline(baseline: dict, dest: Path) -> None:
+    """Write the baseline dict to dest as YAML with a header comment."""
+    header = (
+        "# Generated by xml_to_baseline.py - review before use in audit.py\n"
+        "# Fields with type: numeric and exact 'expected' values were inferred\n"
+        "# from the known-good config.  Add min/max or --tolerance to widen them.\n\n"
+    )
+    yaml_body = _build_yaml_str(baseline)
+    dest.write_text(header + yaml_body, encoding="utf-8")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert a Security Center XML config export to an audit.py "
+            "baseline YAML file."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  %(prog)s sample_config.xml\n"
+            "  %(prog)s sample_config.xml --out prod_baseline.yaml\n"
+            "  %(prog)s sample_config.xml --tolerance 20%%\n"
+            "  %(prog)s sample_config.xml --tolerance 5\n"
+            "  %(prog)s sample_config.xml --exclude smtpHost,smtpFromAddress\n"
+        ),
+    )
+    parser.add_argument(
+        "xml_file",
+        help="Path to the Security Center XML configuration export.",
+    )
+    parser.add_argument(
+        "--out", "-o",
+        default=None,
+        help=(
+            "Output YAML file path.  Defaults to <xml_file_stem>_baseline.yaml "
+            "in the same directory."
+        ),
+    )
+    parser.add_argument(
+        "--tolerance", "-t",
+        default=None,
+        help=(
+            "Allowed variance for numeric fields.  Use a percentage (e.g. 20%%) "
+            "or a flat value (e.g. 5).  Without this flag, numeric fields are "
+            "written as exact-match checks."
+        ),
+    )
+    parser.add_argument(
+        "--exclude", "-e",
+        default="",
+        help=(
+            "Comma-separated list of field names to omit from config_checks "
+            "(e.g. smtpHost,smtpFromAddress,ldapHost)."
+        ),
+    )
+    parser.add_argument(
+        "--description", "-d",
+        default=None,
+        help="Override the baseline description string.",
+    )
+
+    args = parser.parse_args()
+
+    xml_path = Path(args.xml_file)
+    if not xml_path.exists():
+        sys.exit(f"Error: file not found: {xml_path}")
+
+    out_path = (
+        Path(args.out)
+        if args.out
+        else xml_path.with_name(xml_path.stem + "_baseline.yaml")
+    )
+
+    tolerance = None
+    if args.tolerance:
+        try:
+            tolerance = parse_tolerance(args.tolerance)
+        except ValueError as exc:
+            sys.exit(f"Error: invalid --tolerance value: {exc}")
+
+    exclude = {f.strip() for f in args.exclude.split(",") if f.strip()}
+
+    converter = XmlToBaselineConverter(tolerance=tolerance, exclude=exclude)
+
+    try:
+        baseline = converter.convert(xml_path)
+    except (ET.ParseError, FileNotFoundError) as exc:
+        sys.exit(f"Error: {exc}")
+
+    if args.description:
+        baseline["description"] = args.description
+
+    write_baseline(baseline, out_path)
+
+    n_checks = len(baseline.get("config_checks", {}))
+    scope    = baseline.get("scope", {})
+    n_scope  = sum(len(v) for v in scope.values())
+
+    print(f"Converted: {xml_path}  ->  {out_path}")
+    print(f"  config checks : {n_checks}")
+    print(f"  scope entries : {n_scope}  "
+          f"({len(scope.get('cidrs', []))} CIDRs, "
+          f"{len(scope.get('ips', []))} IPs, "
+          f"{len(scope.get('hostnames', []))} hostnames)")
+    if tolerance:
+        kind, amount = tolerance
+        label = f"{amount}%" if kind == "percent" else str(amount)
+        print(f"  tolerance     : {label} ({kind})")
+    if exclude:
+        print(f"  excluded      : {', '.join(sorted(exclude))}")
+
+
+if __name__ == "__main__":
+    main()
