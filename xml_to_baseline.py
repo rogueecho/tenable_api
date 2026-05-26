@@ -317,20 +317,6 @@ def _quoted_str_representer(dumper: yaml.Dumper, data: _QuotedStr) -> yaml.Scala
     return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
 
 
-_SCOPE_STUB = """\
-
-# -- Authorised scanning scope (fill in manually) ----------------------------
-# scope:
-#   cidrs:
-#     - "10.0.0.0/8"
-#     - "192.168.0.0/16"
-#   ips:
-#     - "192.168.1.50"
-#   hostnames:
-#     - "server01.example.com"
-"""
-
-
 def _build_yaml_str(baseline: dict) -> str:
     """Serialise the baseline dict to a YAML string.
 
@@ -375,7 +361,7 @@ def write_baseline(baseline: dict, dest: Path) -> None:
         "# Fields with type: numeric and exact 'expected' values were inferred\n"
         "# from the known-good config.  Add min/max or --tolerance to widen them.\n\n"
     )
-    dest.write_text(header + _build_yaml_str(baseline) + _SCOPE_STUB, encoding="utf-8")
+    dest.write_text(header + _build_yaml_str(baseline), encoding="utf-8")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
