@@ -1,0 +1,106 @@
+# audit_baseline.yaml
+# --------------------
+# Known-good Security Center configuration baseline.
+#
+# config_checks
+# -------------
+# Each key is "section.field" where:
+#   section – top-level key from collect_config_report()
+#             e.g. config | system_info | status | current_user | ip_info
+#   field   – dot-separated path within that section
+#             e.g. sessionTimeout  or  license.status
+#
+# Check types and their required keys:
+#
+#   type: boolean
+#     expected: true | false
+#
+#   type: numeric
+#     expected: <number>          # exact match
+#     -- OR --
+#     min: <number>               # lower bound (inclusive)
+#     max: <number>               # upper bound (inclusive)
+#     (omit min or max to make one side unbounded)
+#
+#   type: string
+#     expected: "<value>"         # exact case-sensitive match
+#
+# scope
+# -----
+# Defines the authorised scanning boundary.
+#   cidrs     – CIDR ranges that MUST be covered by scan zones and that scan
+#               zones MUST NOT exceed
+#   ips       – individual host IPs that must appear in at least one scan zone
+#   hostnames – DNS names that require manual verification (cannot be checked
+#               against IP ranges without resolution)
+
+version: "1.0"
+description: "Production SC security baseline"
+
+# ── Configuration checks ──────────────────────────────────────────────────────
+
+config_checks:
+
+  # System
+  system_info.licenseStatus:
+    type: string
+    expected: "Valid"
+
+  # Platform config
+  config.smtpEncryption:
+    type: string
+    expected: "TLS"
+
+  config.ldapEnabled:
+    type: boolean
+    expected: true
+
+  config.samlEnabled:
+    type: boolean
+    expected: false
+
+  config.sessionTimeout:
+    type: numeric
+    min: 15
+    max: 60
+
+  # Feed / plugin status
+  status.feedStatus:
+    type: string
+    expected: "Current"
+
+  status.updateRunning:
+    type: boolean
+    expected: false
+
+  # Add additional checks below following the same pattern.
+  # Examples (commented out):
+  #
+  # config.smtpPort:
+  #   type: numeric
+  #   expected: 25
+  #
+  # config.allowUserManagement:
+  #   type: boolean
+  #   expected: true
+
+
+# ── Authorised scanning scope ─────────────────────────────────────────────────
+
+scope:
+  description: >
+    Every CIDR and IP listed here must overlap with at least one scan zone
+    (no blind spots), and no scan zone may reach addresses outside these
+    ranges (no over-scanning).
+
+  cidrs:
+    - "192.168.0.0/16"    # Corporate LAN
+    - "10.10.0.0/24"      # DMZ segment
+    - "172.16.50.0/24"    # OT / ICS network
+
+  ips:
+    - "192.168.1.50"      # Example: management host that must always be scanned
+    - "10.10.0.100"       # Example: DMZ jump host
+
+  hostnames:
+    - "server01.corp.example.com"   # Requires manual DNS verification
