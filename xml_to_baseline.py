@@ -4,6 +4,10 @@ xml_to_baseline.py
 Converts an XML Security Center configuration export into a YAML baseline
 compatible with audit.py.
 
+Only the config_checks section is generated.  The scope block (IPs, CIDRs,
+hostnames) must be added to the output file manually — a commented-out
+template is appended to every generated file as a reminder.
+
 Two XML input styles are supported and may be mixed in the same file:
 
   1. Nested section elements  (preferred)
@@ -20,17 +24,6 @@ Two XML input styles are supported and may be mixed in the same file:
 
   2. Flat <Setting> attributes
      <Setting name="sessionTimeout" value="30" section="config"/>
-
-  Scope block (IPs/CIDRs/hostnames for scan boundary checks):
-     <Scope>
-       <CIDRs>
-         <CIDR>192.168.0.0/16</CIDR>
-       </CIDRs>
-       <Hosts>
-         <Host>192.168.1.50</Host>
-         <Host>server01.corp.example.com</Host>
-       </Hosts>
-     </Scope>
 
   See sample_config.xml for a complete example.
 
@@ -64,7 +57,6 @@ Usage:
 """
 
 import argparse
-import ipaddress
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -90,7 +82,8 @@ KNOWN_SECTIONS: set[str] = {
     "organizations",
 }
 
-# Tags that are structural, not config sections.
+# Tags that are structural, not config sections.  These are silently skipped
+# during iteration so the converter stays forward-compatible with new elements.
 STRUCTURAL_TAGS: set[str] = {"Scope", "Metadata", "Settings", "SecurityCenterConfig"}
 
 
@@ -114,27 +107,6 @@ def parse_tolerance(raw: str) -> tuple[str, float]:
             raise ValueError(f"Percentage tolerance must be between 0 and 100, got {pct}")
         return ("percent", pct)
     return ("flat", float(raw))
-
-
-# ── IP classification ─────────────────────────────────────────────────────────
-
-def classify_host_entry(value: str) -> str:
-    """Return "cidr", "ip", or "hostname" for a given string."""
-    value = value.strip()
-    try:
-        net = ipaddress.IPv4Network(value, strict=False)
-        return "cidr" if net.prefixlen < 32 else "ip"
-    except ValueError:
-        # Check for dash range — treat as a CIDR-like scope entry.
-        if "-" in value:
-            parts = value.split("-", 1)
-            try:
-                ipaddress.IPv4Address(parts[0].strip())
-                ipaddress.IPv4Address(parts[1].strip())
-                return "cidr"
-            except (ipaddress.AddressValueError, ValueError):
-                pass
-        return "hostname"
 
 
 # ── Numeric helpers ───────────────────────────────────────────────────────────
@@ -237,38 +209,32 @@ class XmlToBaselineConverter:
         root = tree.getroot()
 
         config_checks: dict[str, dict] = {}
-        scope: dict[str, list[str]] = {"cidrs": [], "ips": [], "hostnames": []}
 
         for child in root:
             tag = child.tag
 
-            if tag == "Scope":
-                self._parse_scope(child, scope)
-            elif tag == "Metadata":
-                pass  # used only for description extraction below
-            elif tag == "Settings":
-                # Flat <Setting name="..." value="..." section="..."/> block
-                self._parse_settings_block(child, config_checks)
+            if tag in STRUCTURAL_TAGS:
+                pass  # Scope, Metadata, Settings wrapper handled separately
             elif tag in KNOWN_SECTIONS or tag.islower():
                 # Nested section element whose tag is a SC report section name
                 self._parse_section(child, tag, config_checks)
             # Unrecognised capitalised tags are silently skipped so the
             # converter stays forward-compatible with new XML elements.
 
-        # Flat <Setting> elements that appear directly under root
-        # (some exporters omit the <Settings> wrapper).
-        for setting in root.iter("Setting"):
-            if setting in root:  # only direct children, not nested
+        # Also handle a <Settings> block if present
+        settings_elem = root.find("Settings")
+        if settings_elem is not None:
+            self._parse_settings_block(settings_elem, config_checks)
+
+        # Flat <Setting> elements directly under root (no <Settings> wrapper)
+        for setting in root:
+            if setting.tag == "Setting":
                 self._parse_single_setting(setting, config_checks)
 
-        # Remove scope lists that are empty to keep the YAML tidy.
-        scope = {k: v for k, v in scope.items() if v}
-
         return {
-            "version":      "1.0",
-            "description":  self._extract_description(root),
+            "version":       "1.0",
+            "description":   self._extract_description(root),
             "config_checks": config_checks,
-            "scope":        scope,
         }
 
     # ── Section parsers ───────────────────────────────────────────────────
@@ -318,35 +284,6 @@ class XmlToBaselineConverter:
         if key not in out:
             out[key] = infer_spec(value, self._tolerance)
 
-    # ── Scope parser ──────────────────────────────────────────────────────
-
-    def _parse_scope(
-        self,
-        scope_elem: ET.Element,
-        scope: dict[str, list[str]],
-    ) -> None:
-        """Populate the scope dict from a <Scope> element.
-
-        Accepts two grouping conventions:
-          <CIDRs><CIDR>…</CIDR></CIDRs>
-          <Hosts><Host>…</Host></Hosts>  (or <IPs><IP>…</IP></IPs>)
-
-        classify_host_entry() determines the final bucket regardless of which
-        grouping tag was used — a /32 in <CIDRs> still lands in "ips", and a
-        CIDR in <Hosts> still lands in "cidrs".  Unresolvable values go to
-        "hostnames".
-        """
-        # Map classify_host_entry() return values to scope dict keys.
-        bucket = {"cidr": "cidrs", "ip": "ips", "hostname": "hostnames"}
-
-        for group in scope_elem:
-            for item in group:
-                value = (item.text or "").strip()
-                if not value:
-                    continue
-                kind = classify_host_entry(value)
-                scope[bucket[kind]].append(value)
-
     # ── Metadata ──────────────────────────────────────────────────────────
 
     @staticmethod
@@ -380,6 +317,20 @@ def _quoted_str_representer(dumper: yaml.Dumper, data: _QuotedStr) -> yaml.Scala
     return dumper.represent_scalar("tag:yaml.org,2002:str", data, style='"')
 
 
+_SCOPE_STUB = """\
+
+# -- Authorised scanning scope (fill in manually) ----------------------------
+# scope:
+#   cidrs:
+#     - "10.0.0.0/8"
+#     - "192.168.0.0/16"
+#   ips:
+#     - "192.168.1.50"
+#   hostnames:
+#     - "server01.example.com"
+"""
+
+
 def _build_yaml_str(baseline: dict) -> str:
     """Serialise the baseline dict to a YAML string.
 
@@ -387,7 +338,6 @@ def _build_yaml_str(baseline: dict) -> str:
     are emitted with double-quotes (matching the hand-authored baseline style).
     Boolean and numeric values use YAML native types.
     """
-    # Quote strings in config_checks.
     quoted_checks: dict[str, Any] = {}
     for key, spec in baseline.get("config_checks", {}).items():
         new_spec = dict(spec)
@@ -395,20 +345,10 @@ def _build_yaml_str(baseline: dict) -> str:
             new_spec["expected"] = _QuotedStr(spec["expected"])
         quoted_checks[key] = new_spec
 
-    # Quote strings in scope lists.
-    def quote_list(lst: list[str]) -> list[_QuotedStr]:
-        return [_QuotedStr(v) for v in lst]
-
-    raw_scope = baseline.get("scope", {})
-    quoted_scope: dict[str, Any] = {
-        k: quote_list(v) for k, v in raw_scope.items()
-    }
-
     out = {
         "version":       _QuotedStr(str(baseline["version"])),
         "description":   _QuotedStr(baseline["description"]),
         "config_checks": quoted_checks,
-        "scope":         quoted_scope,
     }
 
     dumper = yaml.Dumper
@@ -425,14 +365,17 @@ def _build_yaml_str(baseline: dict) -> str:
 
 
 def write_baseline(baseline: dict, dest: Path) -> None:
-    """Write the baseline dict to dest as YAML with a header comment."""
+    """Write the baseline dict to dest as YAML.
+
+    Appends a commented-out scope stub so the user knows exactly where and
+    how to add the scope block without consulting the reference baseline.
+    """
     header = (
         "# Generated by xml_to_baseline.py - review before use in audit.py\n"
         "# Fields with type: numeric and exact 'expected' values were inferred\n"
         "# from the known-good config.  Add min/max or --tolerance to widen them.\n\n"
     )
-    yaml_body = _build_yaml_str(baseline)
-    dest.write_text(header + yaml_body, encoding="utf-8")
+    dest.write_text(header + _build_yaml_str(baseline) + _SCOPE_STUB, encoding="utf-8")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -522,15 +465,9 @@ def main() -> None:
     write_baseline(baseline, out_path)
 
     n_checks = len(baseline.get("config_checks", {}))
-    scope    = baseline.get("scope", {})
-    n_scope  = sum(len(v) for v in scope.values())
 
     print(f"Converted: {xml_path}  ->  {out_path}")
     print(f"  config checks : {n_checks}")
-    print(f"  scope entries : {n_scope}  "
-          f"({len(scope.get('cidrs', []))} CIDRs, "
-          f"{len(scope.get('ips', []))} IPs, "
-          f"{len(scope.get('hostnames', []))} hostnames)")
     if tolerance:
         kind, amount = tolerance
         label = f"{amount}%" if kind == "percent" else str(amount)

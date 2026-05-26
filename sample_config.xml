@@ -62,27 +62,5 @@
     </Settings>
   -->
 
-  <!-- Authorised scanning scope -->
-  <Scope>
-    <!--
-      Every CIDR listed here must overlap with at least one scan zone
-      and no scan zone may reach addresses outside these ranges.
-    -->
-    <CIDRs>
-      <CIDR>192.168.0.0/16</CIDR>
-      <CIDR>10.10.0.0/24</CIDR>
-      <CIDR>172.16.50.0/24</CIDR>
-    </CIDRs>
-
-    <!--
-      Individual IPs that must appear in at least one scan zone.
-      Hostnames are passed through and flagged for manual DNS verification.
-    -->
-    <Hosts>
-      <Host>192.168.1.50</Host>
-      <Host>10.10.0.100</Host>
-      <Host>server01.corp.example.com</Host>
-    </Hosts>
-  </Scope>
 
 </SecurityCenterConfig>
