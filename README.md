@@ -88,12 +88,19 @@ tenable_sc.py  ──►  scan_policies.json  ──►  audit.py  ──►  st
 python tenable_sc.py
 ```
 
-This authenticates to SC, calls `GET /policy` to enumerate every configured
-scan policy, then calls `GET /policy/{id}` for each one to get its full
-configuration (preferences, audit files, and — for Advanced Scan/Audit
-templates — plugin family selections). The list endpoint alone only
-returns summary fields (name, description, status, ...), so this extra
-per-policy call is required to get anything worth auditing.
+This authenticates to SC and pulls two things:
+
+- **Scan policies** — calls `GET /policy` to enumerate every configured
+  scan policy, then calls `GET /policy/{id}` for each one to get its full
+  configuration (preferences, audit files, and — for Advanced Scan/Audit
+  templates — plugin family selections). The list endpoint alone only
+  returns summary fields (name, description, status, ...), so this extra
+  per-policy call is required to get anything worth auditing.
+- **Assets** — calls `GET /asset` to enumerate every configured asset
+  list, then calls `GET /asset/{id}` for each one requesting the
+  `viewableIPs` field (omitted by default) to get that list's actual
+  resolved IP membership. Every repository's IPs, across every asset
+  list, are merged into one deduplicated, sorted set.
 
 Output:
 
@@ -102,15 +109,28 @@ Collecting scan policy configurations from securitycenter.example.com ...
   [ok]  policy 5 (PCI Quarterly)
   [ok]  policy 7 (CIS Hardening Baseline)
   [err] policy 9 (Legacy Audit): 403 Forbidden ...
-  3 scan policy configuration(s) found
+Collecting asset list IPs from securitycenter.example.com ...
+  [ok]  asset list 1 (Web Servers): 42 IP(s)
+  [ok]  asset list 2 (DB Servers): 11 IP(s)
+  2 scan policy configuration(s) found
+  50 deduplicated asset IP(s) found
 
 Report written to scan_policies.json
 ```
 
-`scan_policies.json` is a JSON array, one entry per policy. If a given
-policy's details call fails (e.g. a permissions error), that one entry
-becomes `{"id", "name", "error"}` instead of aborting the whole run — every
-other policy's configuration is still written out.
+`scan_policies.json` is a single JSON object:
+
+```json
+{
+  "scan_policies": [ /* one entry per policy, each its full configuration */ ],
+  "assets":        [ /* deduplicated, sorted IPs across every asset list */ ]
+}
+```
+
+If a given policy's details call (or asset list's IP lookup) fails (e.g. a
+permissions error), that one entry is skipped/recorded with an error
+instead of aborting the whole run — everything else already collected is
+still written out.
 
 ### Step 2 — Author a golden-copy baseline (once, by hand)
 
@@ -145,7 +165,7 @@ Rules `audit.py` applies when parsing this file:
 # Compare against a single saved policy JSON file
 python audit.py --golden golden_scan_policy.xml --current scan_policy.json
 
-# Pick one entry out of the array tenable_sc.py just wrote
+# Pick one entry out of the "scan_policies" list in the blob tenable_sc.py just wrote
 python audit.py --golden golden_scan_policy.xml --current scan_policies.json --index 0
 
 # Pipe straight from tenable_sc.py's output without an intermediate file
@@ -211,11 +231,13 @@ see stderr for the message).
 
 **Pull additional SC objects** — pyTenable exposes one namespace per SC API
 object on the `TenableSC` instance (`sc.policies`, `sc.scans`,
-`sc.scan_instances`, `sc.repositories`, `sc.scan_zones`, `sc.organizations`,
-`sc.credentials`, ...). Add a method to `SecurityCenterClient` in
-[tenable_sc.py](tenable_sc.py) that calls the relevant namespace and shapes
-the result the way callers need — pagination, auth, and retries are
-already handled by pyTenable.
+`sc.scan_instances`, `sc.asset_lists`, `sc.repositories`, `sc.scan_zones`,
+`sc.organizations`, `sc.credentials`, ...). Add a method to
+`SecurityCenterClient` in [tenable_sc.py](tenable_sc.py) that calls the
+relevant namespace and shapes the result the way callers need —
+pagination, auth, and retries are already handled by pyTenable. To add it
+to the combined blob `main()` writes, collect it the same way
+`scan_policies`/`assets` are and add a key to the `output` dict there.
 
 **Adjust the comparison** — `compare_configs()` in [audit.py](audit.py)
 threads `ignore_order`/`exclude_paths` through to `DeepDiff`; other DeepDiff

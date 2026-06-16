@@ -46,8 +46,13 @@ Environment variables (see .env.example):
 
 Usage:
     python tenable_sc.py
-    # Writes scan_policies.json — a JSON array with one entry per configured
-    # scan policy, each containing that policy's full configuration.
+    # Writes scan_policies.json — a single JSON object:
+    #   {
+    #     "scan_policies": [ ... one entry per configured scan policy,
+    #                         each containing that policy's full config ],
+    #     "assets":        [ ... deduplicated, sorted IP addresses across
+    #                         every asset list's resolved membership ]
+    #   }
 
 Extending:
     pyTenable exposes one namespace per SC API object on the TenableSC
@@ -55,6 +60,7 @@ Extending:
         sc.policies        – scan policies            (/rest/policy)
         sc.scans           – scan definitions          (/rest/scan)
         sc.scan_instances  – scan results/instances    (/rest/scanResult)
+        sc.asset_lists     – asset lists               (/rest/asset)
         sc.repositories    – vulnerability repositories
         sc.scan_zones      – scanner-to-IP-range mappings
         sc.organizations   – organisations
@@ -62,8 +68,12 @@ Extending:
     Add a method to SecurityCenterClient that calls the relevant namespace
     and shapes the result the way callers need.  Pagination, auth, and
     retries are handled by pyTenable — there is no need to reimplement them.
+    To add another section to the combined output blob written by main(),
+    collect it the same way scan_policies/assets are and add a key to the
+    `output` dict there.
 """
 
+import ipaddress
 import json
 import os
 import sys
@@ -88,6 +98,9 @@ class SecurityCenterClient:
     get_scan_policies            – every scan policy, summary fields only
     get_scan_policy_details      – one scan policy's full configuration
     collect_scan_policy_configs  – every scan policy's full configuration
+    get_asset_lists               – every asset list, summary fields only
+    get_asset_list_ips            – one asset list's deduplicated member IPs
+    collect_all_asset_ips         – deduplicated member IPs across every asset list
     """
 
     def __init__(
@@ -180,6 +193,92 @@ class SecurityCenterClient:
 
         return configs
 
+    # ── Asset lists ───────────────────────────────────────────────────────────
+
+    def get_asset_lists(self) -> list[dict[str, Any]]:
+        """Return every configured asset list as a flat list of summaries.
+
+        Wraps GET /asset via pyTenable's sc.asset_lists.list().  Per the SC
+        API docs the response shape is role-dependent: an administrator
+        gets {"assets": [...]}, while a non-administrator (organization
+        user) gets {"usable": [...], "manageable": [...]}.  All three keys
+        are checked so this works for either role.
+
+        Note: list entries are summaries only (id, name, type, ...) — they
+        do NOT include member IP addresses.  Use get_asset_list_ips() or
+        collect_all_asset_ips() for actual host membership.
+        """
+        data = self._sc.asset_lists.list()
+        return data.get("assets") or data.get("usable") or data.get("manageable") or []
+
+    def get_asset_list_ips(self, asset_list_id: int | str) -> set[str]:
+        """Return the deduplicated set of member IPs for one asset list, by ID.
+
+        Wraps GET /asset/{id} via pyTenable's sc.asset_lists.details(),
+        explicitly requesting the "viewableIPs" field — per the SC API
+        docs this field is omitted unless requested, and is the only place
+        actual resolved IP membership appears (the default fields describe
+        the list's type/rules, not its current members).  viewableIPs is
+        broken down per repository as
+        {"repository": {...}, "ipList": "<newline-separated IPs>", "ipCount": ...};
+        every repository's ipList is flattened into one deduplicated set.
+        Each split token is validated with ipaddress.ip_address() so a
+        stray blank line or malformed entry is silently dropped rather
+        than corrupting the result.
+        """
+        details = self._sc.asset_lists.details(
+            int(asset_list_id), fields=["id", "name", "viewableIPs"]
+        )
+
+        ips: set[str] = set()
+        for entry in details.get("viewableIPs") or []:
+            for token in (entry.get("ipList") or "").splitlines():
+                token = token.strip()
+                if not token:
+                    continue
+                try:
+                    ips.add(str(ipaddress.ip_address(token)))
+                except ValueError:
+                    continue
+        return ips
+
+    def collect_all_asset_ips(self) -> list[str]:
+        """Return the deduplicated, sorted list of every IP across every asset list.
+
+        Fetches the asset list summary first to discover every asset list
+        ID, then requests viewableIPs for each one and merges all of them
+        into a single deduplicated set.  If a given asset list's details
+        call fails (e.g. a permissions error, or a malformed summary
+        missing/with a non-numeric "id"), it is skipped and logged to
+        stderr rather than aborting the whole run — one bad asset list
+        should not discard every other asset list's IPs already collected.
+        """
+        all_ips: set[str] = set()
+
+        for asset_list in self.get_asset_lists():
+            asset_id = asset_list.get("id")
+            try:
+                if asset_id is None:
+                    raise ValueError("asset list summary is missing an 'id' field")
+                ips = self.get_asset_list_ips(asset_id)
+                all_ips.update(ips)
+                print(f"  [ok]  asset list {asset_id} ({asset_list.get('name')}): {len(ips)} IP(s)")
+            except (RestflyException, ValueError, TypeError) as exc:
+                print(
+                    f"  [err] asset list {asset_id} ({asset_list.get('name')}): {exc}",
+                    file=sys.stderr,
+                )
+
+        return sorted(all_ips, key=_ip_sort_key)
+
+
+# ── Sorting helpers ───────────────────────────────────────────────────────────
+
+def _ip_sort_key(ip_str: str) -> tuple:
+    """Numeric (not lexical) sort key, grouping IPv4 before IPv6."""
+    ip = ipaddress.ip_address(ip_str)
+    return (ip.version, ip)
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -205,17 +304,26 @@ def main() -> None:
 
         print(f"Collecting scan policy configurations from {host} ...")
         scan_policies = client.collect_scan_policy_configs()
+
+        print(f"Collecting asset list IPs from {host} ...")
+        assets = client.collect_all_asset_ips()
     except RestflyException as exc:
         sys.exit(f"Error: failed to communicate with Security Center: {exc}")
+
+    output = {
+        "scan_policies": scan_policies,
+        "assets":        assets,
+    }
 
     output_path = "scan_policies.json"
     try:
         with open(output_path, "w", encoding="utf-8") as fh:
-            json.dump(scan_policies, fh, indent=2, default=str)
+            json.dump(output, fh, indent=2, default=str)
     except OSError as exc:
         sys.exit(f"Error: failed to write {output_path}: {exc}")
 
     print(f"  {len(scan_policies)} scan policy configuration(s) found")
+    print(f"  {len(assets)} deduplicated asset IP(s) found")
     print(f"\nReport written to {output_path}")
 
 
