@@ -1,9 +1,19 @@
 """
 audit.py
 --------
-Audits a live Tenable Security Center scan policy configuration (JSON)
-against a golden-copy baseline (XML) using DeepDiff.
+Two related but independent Security Center audits, selected with a
+subcommand:
 
+  policy  – diffs a live scan policy configuration (JSON) against a
+            golden-copy baseline (XML) using DeepDiff.
+  scope   – compares tenable_sc.py's live asset IPs (from Security
+            Center's asset lists) against an authorised scope extracted
+            from documents by scope_extractor.py, using CIDR-aware
+            containment checks rather than literal string comparison.
+
+=====================================================================
+ policy
+=====================================================================
 A "scan policy" here means the object returned by GET /policy/{id} — a
 reusable template of scan preferences, audit files, and plugin family
 selections.  It is distinct from a "scan" (which adds targets/schedule/
@@ -12,26 +22,26 @@ the docstring in tenable_sc.py for the full distinction.
 
 Inputs
 ------
-  golden   – an XML file describing the known-good configuration of one
-             scan policy.  Nested elements map to nested dict keys;
-             repeated sibling elements with the same tag collapse into a
-             list.  Leaf text is kept as a plain string by default (see
-             --infer-types) because the SC REST API returns nearly every
-             policy field — including numbers and booleans — as a string;
-             coercing types here would manufacture spurious discrepancies
-             against that live data.
+  --golden   – an XML file describing the known-good configuration of one
+               scan policy.  Nested elements map to nested dict keys;
+               repeated sibling elements with the same tag collapse into a
+               list.  Leaf text is kept as a plain string by default (see
+               --infer-types) because the SC REST API returns nearly every
+               policy field — including numbers and booleans — as a string;
+               coercing types here would manufacture spurious discrepancies
+               against that live data.
 
-  current  – the live configuration of a single scan policy as JSON, i.e.
-             one entry from the "scan_policies" list returned by
-             tenable_sc.SecurityCenterClient.collect_scan_policy_configs().
-             Read from a file (--current) or from stdin (pipe it straight
-             out of tenable_sc.py).  Three input shapes are accepted: a
-             single policy object, a bare list of them, or the combined
-             blob tenable_sc.py's main() writes to scan_policies.json
-             ({"scan_policies": [...], "assets": [...]}) — the "assets"
-             key is ignored here.  If a list of policies is in play
-             (either bare or unwrapped from the blob), --index selects
-             which entry to audit.
+  --current  – the live configuration of a single scan policy as JSON, i.e.
+               one entry from the "scan_policies" list returned by
+               tenable_sc.SecurityCenterClient.collect_scan_policy_configs().
+               Read from a file or from stdin (pipe it straight out of
+               tenable_sc.py).  Three input shapes are accepted: a single
+               policy object, a bare list of them, or the combined blob
+               tenable_sc.py's main() writes to scan_policies.json
+               ({"scan_policies": [...], "assets": [...]}) — the "assets"
+               key is ignored here.  If a list of policies is in play
+               (either bare or unwrapped from the blob), --index selects
+               which entry to audit.
 
 Comparison
 ----------
@@ -46,37 +56,92 @@ tiny unified diff.
 
 Usage:
     # Compare a golden XML file against a single live scan policy JSON file
-    python audit.py --golden golden_scan_policy.xml --current scan_policy.json
+    python audit.py policy --golden golden_scan_policy.xml --current scan_policy.json
 
     # Pipe straight from tenable_sc.py and pick one entry out of the array
     python tenable_sc.py
-    python audit.py --golden golden_scan_policy.xml --current scan_policies.json --index 0
-    type scan_policies.json | python audit.py --golden golden_scan_policy.xml --index 0
+    python audit.py policy --golden golden_scan_policy.xml --current scan_policies.json --index 0
+    type scan_policies.json | python audit.py policy --golden golden_scan_policy.xml --index 0
 
     # Ignore fields that are expected to change between runs
-    python audit.py --golden golden_scan_policy.xml --current scan_policy.json ^
+    python audit.py policy --golden golden_scan_policy.xml --current scan_policy.json ^
         --exclude-path "root['modifiedTime']"
-
-Exit codes:
-    0  – no discrepancies found
-    1  – one or more discrepancies found
-    (a malformed/missing input exits non-zero via sys.exit(<message>))
 
 Extending:
     New comparison knobs (significant_digits, exclude_regex_paths, etc.) can
     be threaded through compare_configs() — see the DeepDiff documentation
     for the full option set.
+
+=====================================================================
+ scope
+=====================================================================
+Compares what Security Center is actually scanning against what a
+scoping document says is authorised, using IP/CIDR containment — not
+DeepDiff, which only knows literal value equality and has no concept of
+"this /24 covers that address".
+
+Inputs
+------
+  --golden   – scope_extractor.py's output file (YAML or JSON, detected by
+               extension): a mapping with "cidrs", "ips", and "hostnames"
+               lists.  This is the authorised scope — the "known good"
+               boundary, playing the same baseline role --golden plays for
+               the policy subcommand.
+
+  --current  – tenable_sc.py's output: either the full
+               {"scan_policies": [...], "assets": [...]} blob (the
+               "assets" key — a deduplicated list of every IP Security
+               Center's asset lists resolve to — is used; "scan_policies"
+               is ignored here), or a bare JSON array of IP strings.  Read
+               from a file or from stdin.
+
+Comparison
+----------
+Every scope CIDR/IP is converted to an ipaddress network (a bare IP
+becomes a single-host /32 or /128); every live asset entry is parsed as an
+address.  Two passes, mirroring the old pre-rewrite scope audit:
+
+  uncovered scope     – a scope CIDR/IP with no live asset address inside
+                         it: something authorised that doesn't appear to
+                         be getting scanned (a blind spot).
+  out-of-scope asset   – a live asset address not contained in any scope
+                         CIDR/IP: something being scanned outside the
+                         authorised boundary.
+
+Scope hostnames can't be matched against IP-only live asset data without
+DNS resolution, so each is flagged for manual verification rather than
+silently skipped.  Unparseable entries on either side are skipped with a
+warning rather than aborting the comparison.
+
+Following the same +/- convention as the policy subcommand (scope is the
+baseline/"golden", live assets are "current"):
+    +  out-of-scope asset  (green) — present in current, not in golden
+    -  uncovered scope     (red)   — present in golden, not in current
+
+Usage:
+    python tenable_sc.py
+    python scope_extractor.py scoping_docs/ --recursive --out scope.yaml
+    python audit.py scope --golden scope.yaml --current scan_policies.json
+
+=====================================================================
+Exit codes (both subcommands):
+    0  – no discrepancies found
+    1  – one or more discrepancies found
+    (a malformed/missing input exits non-zero via sys.exit(<message>))
 """
 
 import argparse
+import ipaddress
 import json
 import sys
 import xml.etree.ElementTree as ET
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import colorama
 import defusedxml.ElementTree as DET
+import yaml
 from deepdiff import DeepDiff
 
 colorama.init()
@@ -390,14 +455,224 @@ def write_diff(diff: DeepDiff, path: str | Path) -> None:
     Path(path).write_text(diff.to_json(indent=2), encoding="utf-8")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  scope subcommand
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Loading ───────────────────────────────────────────────────────────────────
+
+def load_scope_file(path: str | Path) -> dict[str, Any]:
+    """Load scope_extractor.py's output (YAML or JSON, by extension).
+
+    Returns the raw mapping as written — callers read "cidrs"/"ips"/
+    "hostnames" with .get(key) or [] so a missing key (e.g. a scope file
+    produced with --no-hostnames) doesn't need special-casing here.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p}")
+
+    text = p.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text) if p.suffix.lower() == ".json" else yaml.safe_load(text)
+    except (json.JSONDecodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"Malformed scope file {p}: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{p}: expected a mapping with cidrs/ips/hostnames keys, "
+            f"got {type(data).__name__}"
+        )
+    return data
+
+
+def load_live_assets(path: str | None) -> list[str]:
+    """Load the live asset IP list from tenable_sc.py's output.
+
+    Accepts either the full {"scan_policies": [...], "assets": [...]} blob
+    main() writes ("scan_policies" is ignored here), or a bare JSON array
+    of IP strings.  Reads from path, or from stdin if path is None.
+    """
+    if path is None:
+        raw = sys.stdin.read()
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Malformed JSON on stdin: {exc}") from exc
+    else:
+        data = _load_json_file(path)
+
+    if isinstance(data, dict) and "assets" in data:
+        data = data["assets"]
+
+    if not isinstance(data, list):
+        raise ValueError(
+            f'Expected a JSON array of IPs, or a {{"assets": [...]}} object, '
+            f"got {type(data).__name__}"
+        )
+    return data
+
+
+# ── Comparison ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class ScopeIssue:
+    """A gap or violation found while comparing live assets to authorised scope."""
+    category: str  # "uncovered_scope" | "out_of_scope_asset" | "unverified_hostname"
+    entry:    str   # the scope CIDR/IP, live asset IP, or hostname that triggered this
+    message:  str
+
+
+def _parse_network(entry: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    """Parse a bare IP or CIDR string into a network (a bare IP becomes a
+    single-host /32 or /128).  Returns None rather than raising so callers
+    can skip-and-warn on unparseable entries (e.g. a hostname in "ips")."""
+    try:
+        return ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        return None
+
+
+def compare_scope(live_assets: list[str], scope: dict[str, Any]) -> list[ScopeIssue]:
+    """Compare live scanned asset IPs against an authorised scope.
+
+    Pass 1 -- uncovered scope: every CIDR/IP in the authorised scope must
+        be matched by at least one live asset address, or it's a blind
+        spot (something authorised that doesn't appear to be scanned).
+    Pass 2 -- out-of-scope assets: every live asset address must fall
+        within at least one authorised scope CIDR/IP, or it's scanning
+        something outside the approved boundary.
+    Scope hostnames cannot be matched against IP-only live asset data
+    without DNS resolution, so each is flagged for manual verification.
+    Entries on either side that don't parse as a valid IP/CIDR are skipped
+    with a warning rather than aborting the whole comparison.
+
+    Args:
+        live_assets: IP strings, e.g. from load_live_assets().
+        scope:       Mapping with "cidrs"/"ips"/"hostnames" lists, e.g.
+                     from load_scope_file().
+
+    Returns:
+        List of ScopeIssue — empty means full agreement.
+    """
+    scope_networks: list[tuple[str, ipaddress.IPv4Network | ipaddress.IPv6Network]] = []
+    for entry in [*(scope.get("cidrs") or []), *(scope.get("ips") or [])]:
+        net = _parse_network(entry)
+        if net is None:
+            print(f"  [warn] scope entry '{entry}' is not a valid IP/CIDR — skipped", file=sys.stderr)
+            continue
+        scope_networks.append((entry, net))
+
+    live_addresses: list[tuple[str, ipaddress.IPv4Address | ipaddress.IPv6Address]] = []
+    for entry in live_assets:
+        try:
+            live_addresses.append((entry, ipaddress.ip_address(entry)))
+        except (ValueError, TypeError):
+            print(f"  [warn] live asset entry '{entry}' is not a valid IP — skipped", file=sys.stderr)
+            continue
+
+    issues: list[ScopeIssue] = []
+
+    for entry, net in scope_networks:
+        if not any(addr in net for _, addr in live_addresses):
+            issues.append(ScopeIssue(
+                "uncovered_scope", entry,
+                f"{entry} is authorised scope but no live asset falls within "
+                f"it — it may not be getting scanned",
+            ))
+
+    for entry, addr in live_addresses:
+        if not any(addr in net for _, net in scope_networks):
+            issues.append(ScopeIssue(
+                "out_of_scope_asset", entry,
+                f"{entry} is a live scanned asset but is not covered by any "
+                f"authorised scope entry",
+            ))
+
+    for hostname in scope.get("hostnames") or []:
+        issues.append(ScopeIssue(
+            "unverified_hostname", hostname,
+            f"hostname '{hostname}' requires DNS resolution to verify "
+            f"against live asset IPs — check manually",
+        ))
+
+    return issues
+
+
+# ── Reporting ─────────────────────────────────────────────────────────────────
+
+def print_scope_report(
+    issues: list[ScopeIssue],
+    scope_label: str,
+    live_label: str,
+    use_color: bool = True,
+) -> None:
+    """Print a human-readable scope audit report to stdout.
+
+    Follows the same +/- convention as print_diff(), with scope as the
+    baseline ("golden") and live assets as "current":
+        +  out-of-scope asset  (green) — present in current, not golden
+        -  uncovered scope     (red)   — present in golden, not current
+    Hostnames needing manual DNS verification are shown separately, marked
+    "~" (neutral), since they're not a confirmed discrepancy either way.
+    """
+    sep = "=" * 64
+
+    print(f"\n{sep}")
+    print("  Asset Scope Audit")
+    print(f"  Scope (authorised) : {scope_label}")
+    print(f"  Live (scanned)      : {live_label}")
+    print(f"{sep}\n")
+
+    if not issues:
+        print(_c("  RESULT: PASS - no scope discrepancies found", _GREEN, use_color))
+        print(sep)
+        return
+
+    uncovered    = [i for i in issues if i.category == "uncovered_scope"]
+    out_of_scope = [i for i in issues if i.category == "out_of_scope_asset"]
+    unverified   = [i for i in issues if i.category == "unverified_hostname"]
+
+    if uncovered:
+        print(f"Uncovered scope ({len(uncovered)}) — authorised but no matching live asset:")
+        for issue in uncovered:
+            print(_c(f"  - {issue.entry}", _RED, use_color))
+            print(f"      {issue.message}")
+        print()
+
+    if out_of_scope:
+        print(f"Out-of-scope assets ({len(out_of_scope)}) — scanned but not authorised:")
+        for issue in out_of_scope:
+            print(_c(f"  + {issue.entry}", _GREEN, use_color))
+            print(f"      {issue.message}")
+        print()
+
+    if unverified:
+        print(f"Hostnames requiring manual verification ({len(unverified)}):")
+        for issue in unverified:
+            print(_c(f"  ~ {issue.entry}", _YELLOW, use_color))
+            print(f"      {issue.message}")
+        print()
+
+    print(sep)
+    print(_c(f"  RESULT: FAIL - {len(issues)} issue(s) found", _BOLD + _RED, use_color))
+    print(sep)
+
+
+def write_scope_report(issues: list[ScopeIssue], path: str | Path) -> None:
+    """Serialise the scope audit findings to a JSON file."""
+    Path(path).write_text(
+        json.dumps([asdict(i) for i in issues], indent=2),
+        encoding="utf-8",
+    )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Audit a live Tenable Security Center scan policy configuration "
-            "(JSON) against a golden-copy baseline (XML) using DeepDiff."
-        ),
+def _add_policy_subparser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "policy",
+        help="Diff a live scan policy configuration against a golden-copy XML baseline.",
     )
     parser.add_argument(
         "--golden", "-g", required=True,
@@ -445,8 +720,9 @@ def main() -> None:
         "--no-color", action="store_true",
         help="Disable ANSI color in the stdout report.",
     )
-    args = parser.parse_args()
 
+
+def _run_policy_audit(args: argparse.Namespace) -> None:
     try:
         golden  = xml_to_dict(args.golden, infer_types=args.infer_types)
         current = load_current_config(args.current, args.index)
@@ -469,6 +745,71 @@ def main() -> None:
     print(f"\nFull report written to {args.out}")
 
     sys.exit(1 if diff else 0)
+
+
+def _add_scope_subparser(subparsers: argparse._SubParsersAction) -> None:
+    parser = subparsers.add_parser(
+        "scope",
+        help=(
+            "Compare tenable_sc.py's live asset IPs against scope_extractor.py's "
+            "authorised scope."
+        ),
+    )
+    parser.add_argument(
+        "--golden", "-g", required=True,
+        help="Path to scope_extractor.py's output (YAML or JSON) — the authorised scope.",
+    )
+    parser.add_argument(
+        "--current", "-c", default=None,
+        help=(
+            "Path to tenable_sc.py's output (scan_policies.json) or a bare JSON "
+            "array of IPs. Omit to read JSON from stdin."
+        ),
+    )
+    parser.add_argument(
+        "--out", "-o", default="scope_audit_report.json",
+        help="Path for the structured JSON findings report (default: scope_audit_report.json).",
+    )
+    parser.add_argument(
+        "--no-color", action="store_true",
+        help="Disable ANSI color in the stdout report.",
+    )
+
+
+def _run_scope_audit(args: argparse.Namespace) -> None:
+    try:
+        scope       = load_scope_file(args.golden)
+        live_assets = load_live_assets(args.current)
+    except (FileNotFoundError, ValueError) as exc:
+        sys.exit(f"Error: {exc}")
+
+    issues = compare_scope(live_assets, scope)
+
+    current_label = args.current or "<stdin>"
+    print_scope_report(issues, args.golden, current_label, use_color=not args.no_color)
+
+    try:
+        write_scope_report(issues, args.out)
+    except OSError as exc:
+        sys.exit(f"Error: failed to write {args.out}: {exc}")
+    print(f"\nFull report written to {args.out}")
+
+    sys.exit(1 if issues else 0)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Audit a Tenable Security Center deployment.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    _add_policy_subparser(subparsers)
+    _add_scope_subparser(subparsers)
+    args = parser.parse_args()
+
+    if args.command == "policy":
+        _run_policy_audit(args)
+    elif args.command == "scope":
+        _run_scope_audit(args)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,13 @@
-# Tenable Security Center Scan Policy Auditor
+# Tenable Security Center Scan Policy & Scope Auditor
 
-A small Python toolkit that pulls scan policy configurations out of a
+A small Python toolkit that pulls scan policy and asset data out of a
 Tenable Security Center (SC) instance via [pyTenable](https://pytenable.readthedocs.io/)
-and audits them against a hand-authored "golden copy" baseline using
-[DeepDiff](https://zepworks.com/deepdiff/).
+and audits it two ways:
+
+- **Policy config** against a hand-authored "golden copy" baseline, using
+  [DeepDiff](https://zepworks.com/deepdiff/).
+- **Asset scope coverage** against an authorised scope extracted from
+  arbitrary scoping documents, using IP/CIDR containment checks.
 
 ## What this actually does
 
@@ -22,10 +26,11 @@ does not touch scan definitions or scan results.
 
 | File | Purpose |
 |---|---|
-| [tenable_sc.py](tenable_sc.py) | Pulls every scan policy's full configuration from SC and writes it to JSON |
-| [audit.py](audit.py) | Diffs one live scan policy (JSON) against a golden-copy baseline (XML) |
-| [golden_scan_policy.xml](golden_scan_policy.xml) | Example golden-copy baseline, for use with `audit.py` |
-| [sample_scan_policy.json](sample_scan_policy.json) | Example live policy JSON, for testing `audit.py` without a live SC instance |
+| [tenable_sc.py](tenable_sc.py) | Pulls every scan policy's full configuration and every asset list's IPs from SC, writes both to JSON |
+| [scope_extractor.py](scope_extractor.py) | Extracts IPs/CIDRs/hostnames from arbitrary scoping documents (text, CSV, Word, PDF, routing tables, ...) |
+| [audit.py](audit.py) | Two subcommands: `policy` diffs a live scan policy against a golden-copy XML baseline; `scope` compares live asset IPs against an authorised scope |
+| [golden_scan_policy.xml](golden_scan_policy.xml) | Example golden-copy policy baseline, for use with `audit.py policy` |
+| [sample_scan_policy.json](sample_scan_policy.json) | Example live policy JSON, for testing `audit.py policy` without a live SC instance |
 
 ## Requirements
 
@@ -60,6 +65,8 @@ pytenable>=26.6
 python-dotenv>=1.0
 deepdiff>=9.1
 colorama>=0.4
+defusedxml>=0.7
+pyyaml>=6.0
 ```
 
 **.env** (copied from `.env.example`; never commit this file):
@@ -77,9 +84,13 @@ Generate**.
 ## Workflow
 
 ```
-tenable_sc.py  ──►  scan_policies.json  ──►  audit.py  ──►  stdout report + audit_report.json
-                                              ▲
-                              golden_scan_policy.xml (hand-authored once)
+tenable_sc.py  ──►  scan_policies.json  ──►  audit.py policy  ──►  stdout report + audit_report.json
+                       │  ▲                        ▲
+                       │  └── golden_scan_policy.xml (hand-authored once)
+                       │
+                       └─────────────────────────►  audit.py scope  ──►  stdout report + scope_audit_report.json
+                                                          ▲
+scoping documents ──►  scope_extractor.py  ──►  scope.yaml
 ```
 
 ### Step 1 — Pull live scan policy configurations
@@ -163,19 +174,19 @@ Rules `audit.py` applies when parsing this file:
 
 ```bash
 # Compare against a single saved policy JSON file
-python audit.py --golden golden_scan_policy.xml --current scan_policy.json
+python audit.py policy --golden golden_scan_policy.xml --current scan_policy.json
 
 # Pick one entry out of the "scan_policies" list in the blob tenable_sc.py just wrote
-python audit.py --golden golden_scan_policy.xml --current scan_policies.json --index 0
+python audit.py policy --golden golden_scan_policy.xml --current scan_policies.json --index 0
 
 # Pipe straight from tenable_sc.py's output without an intermediate file
-type scan_policies.json | python audit.py --golden golden_scan_policy.xml --index 0
+type scan_policies.json | python audit.py policy --golden golden_scan_policy.xml --index 0
 ```
 
 Try it now with the bundled samples (no live SC instance needed):
 
 ```bash
-python audit.py --golden golden_scan_policy.xml --current sample_scan_policy.json --index 0
+python audit.py policy --golden golden_scan_policy.xml --current sample_scan_policy.json --index 0
 ```
 
 #### Output
@@ -216,7 +227,7 @@ The same discrepancies are also written as structured JSON (via
 Exit codes: `0` no discrepancies, `1` discrepancies found (or a bad input —
 see stderr for the message).
 
-#### Useful flags
+#### `policy` flags
 
 | Flag | Effect |
 |---|---|
@@ -226,6 +237,42 @@ see stderr for the message).
 | `--strict-order` | Treat list element order as significant (default: ignored) |
 | `--infer-types` | Coerce golden XML leaf text to bool/int/float instead of comparing as strings |
 | `--no-color` | Disable ANSI color in the stdout report |
+
+### Step 4 — Audit asset scope coverage
+
+First, turn a scoping document (an SOW, an asset list, a network export —
+see [scope_extractor.py](scope_extractor.py)'s own docs for supported
+formats, including Cisco/ASA/Palo Alto/Juniper routing table output) into
+a structured scope file:
+
+```bash
+python scope_extractor.py SOW.docx network_export.txt --out scope.yaml
+```
+
+Then compare it against what Security Center's asset lists actually
+resolve to:
+
+```bash
+python audit.py scope --golden scope.yaml --current scan_policies.json
+```
+
+`--golden` here is scope_extractor.py's output (the authorised boundary);
+`--current` is tenable_sc.py's output (only its `"assets"` key is used —
+`"scan_policies"` is ignored for this subcommand). Comparison is
+CIDR-aware: a scope entry like `10.0.0.0/24` is satisfied by any live
+asset IP inside that range, not just an exact string match.
+
+Two kinds of finding, printed with the same `+`/`-` convention as
+`policy` (scope plays the "golden" role, live assets play "current"):
+
+- `-` (red) **uncovered scope** — authorised but no live asset matches it; a potential blind spot.
+- `+` (green) **out-of-scope asset** — being scanned but not within any authorised range.
+
+Scope hostnames can't be checked against IP-only live data without DNS
+resolution, so they're listed separately for manual verification rather
+than silently passed or failed. Findings are also written as JSON to
+`--out` (default `scope_audit_report.json`). Exit codes match `policy`:
+`0` clean, `1` findings (or bad input).
 
 ## Extending
 
@@ -239,10 +286,14 @@ pagination, auth, and retries are already handled by pyTenable. To add it
 to the combined blob `main()` writes, collect it the same way
 `scan_policies`/`assets` are and add a key to the `output` dict there.
 
-**Adjust the comparison** — `compare_configs()` in [audit.py](audit.py)
+**Adjust the policy comparison** — `compare_configs()` in [audit.py](audit.py)
 threads `ignore_order`/`exclude_paths` through to `DeepDiff`; other DeepDiff
 options (`significant_digits`, `exclude_regex_paths`, etc.) can be added
 the same way.
+
+**Adjust the scope comparison** — `compare_scope()` in [audit.py](audit.py)
+does the CIDR-containment checks; add a new `ScopeIssue` category there
+(and a heading in `print_scope_report()`) for new kinds of finding.
 
 ## Security notes
 
@@ -250,5 +301,7 @@ the same way.
   `.gitignore`. Never commit real credentials.
 - Set `SC_VERIFY_SSL=true` in production environments. The `false` default
   in `.env.example` is for lab/test use only.
-- Both scripts only perform read (`GET`) requests against the SC API — an
-  API key scoped to a read-only role is sufficient.
+- `tenable_sc.py` and `audit.py` only perform read (`GET`) requests
+  against the SC API — an API key scoped to a read-only role is
+  sufficient. `scope_extractor.py` makes no network calls at all; it only
+  reads local files.
