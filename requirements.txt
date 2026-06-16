@@ -3,3 +3,4 @@ python-dotenv>=1.0
 deepdiff>=9.1
 colorama>=0.4
 defusedxml>=0.7
+pyyaml>=6.0
