@@ -11,6 +11,29 @@ the previous requests-based implementation carried.  It just wraps the calls
 this project needs and shapes the output the way the rest of the toolkit
 expects.
 
+Scan policy vs. scan vs. scan result
+-------------------------------------
+Security Center has three distinct, easily-confused object types — this
+module deliberately pulls the first one:
+    Scan policy  (/rest/policy)      – a reusable template of scan settings:
+                                        preferences, plugin family selection,
+                                        audit files.  No targets, no schedule.
+    Scan         (/rest/scan)        – a configured scan: references a
+                                        policy plus targets, a schedule, a
+                                        repository, a zone, etc.
+    Scan result  (/rest/scanResult)  – one executed run of a scan: status,
+                                        start/finish time, IP/check counts.
+Confirmed against the Tenable Security Center API docs
+(docs.tenable.com/security-center/api/Scan-Policy.htm) and by inspecting the
+installed pyTenable source (tenable.sc.policies.ScanPolicyAPI): GET /policy
+returns only summary fields (name, description, status, policyTemplate,
+creator, ...); the full configuration — preferences, auditFiles, and (for
+Advanced Scan/Audit templates) the families plugin-family selection — is
+only present in the GET /policy/{id} response.  collect_scan_policy_configs()
+below fetches the summary list first to discover every policy ID, then
+requests full details for each one so the output actually reflects each
+policy's configuration rather than just its name and status.
+
 Authentication uses API key pairs (Access Key + Secret Key), available in
 Security Center 5.13+.  Credentials are read from environment variables so
 they never live in source code.
@@ -23,19 +46,19 @@ Environment variables (see .env.example):
 
 Usage:
     python tenable_sc.py
-    # Writes scan_instances.json — a JSON array with one entry per scan
-    # instance (scan result) Security Center knows about.
+    # Writes scan_policies.json — a JSON array with one entry per configured
+    # scan policy, each containing that policy's full configuration.
 
 Extending:
     pyTenable exposes one namespace per SC API object on the TenableSC
     instance, e.g.:
-        sc.scans          – scan definitions       (/rest/scan)
-        sc.scan_instances – scan results/instances  (/rest/scanResult)
+        sc.policies        – scan policies            (/rest/policy)
+        sc.scans           – scan definitions          (/rest/scan)
+        sc.scan_instances  – scan results/instances    (/rest/scanResult)
         sc.repositories    – vulnerability repositories
         sc.scan_zones      – scanner-to-IP-range mappings
         sc.organizations   – organisations
-        sc.policies         – scan policies
-        sc.credentials      – stored credentials
+        sc.credentials     – stored credentials
     Add a method to SecurityCenterClient that calls the relevant namespace
     and shapes the result the way callers need.  Pagination, auth, and
     retries are handled by pyTenable — there is no need to reimplement them.
@@ -61,7 +84,9 @@ class SecurityCenterClient:
 
     Public interface
     -----------------
-    get_scan_instances – every scan instance (scan result) as a flat list
+    get_scan_policies            – every scan policy, summary fields only
+    get_scan_policy_details      – one scan policy's full configuration
+    collect_scan_policy_configs  – every scan policy's full configuration
     """
 
     def __init__(
@@ -87,19 +112,49 @@ class SecurityCenterClient:
             ssl_verify=verify_ssl,
         )
 
-    # ── Scan instances ───────────────────────────────────────────────────────
+    # ── Scan policies ─────────────────────────────────────────────────────────
 
-    def get_scan_instances(self) -> list[dict[str, Any]]:
-        """Return every scan instance (result of a configured scan) as a flat list.
+    def get_scan_policies(self) -> list[dict[str, Any]]:
+        """Return every configured scan policy as a flat list of summaries.
 
-        Wraps GET /scanResult via pyTenable's sc.scan_instances.list(), which
-        returns a dict split into "usable" (every instance visible to this
-        API user) and "manageable" (the subset this user can manage/edit).
-        "usable" is the superset and is preferred; "manageable" is only used
-        as a fallback for accounts where "usable" is absent.
+        Wraps GET /policy via pyTenable's sc.policies.list(), which returns a
+        dict split into "usable" (every policy visible to this API user) and
+        "manageable" (the subset this user can edit).  "usable" is the
+        superset and is preferred; "manageable" is only used as a fallback
+        for accounts where "usable" is absent.
+
+        Note: per the SC API docs, GET /policy only returns summary fields
+        (name, description, status, policyTemplate, creator, ...) — it does
+        NOT include preferences, auditFiles, or families.  Use
+        get_scan_policy_details() or collect_scan_policy_configs() for the
+        full configuration of a policy.
         """
-        data = self._sc.scan_instances.list()
+        data = self._sc.policies.list()
         return data.get("usable") or data.get("manageable") or []
+
+    def get_scan_policy_details(self, policy_id: int | str) -> dict[str, Any]:
+        """Return the full configuration of one scan policy, by ID.
+
+        Wraps GET /policy/{id} via pyTenable's sc.policies.details(), which
+        — unlike the summary list endpoint — includes preferences,
+        auditFiles, and (for Advanced Scan/Audit templates only) the
+        families plugin-family selection.
+        """
+        return self._sc.policies.details(int(policy_id))
+
+    def collect_scan_policy_configs(self) -> list[dict[str, Any]]:
+        """Return the full configuration of every scan policy Security Center
+        knows about.
+
+        GET /policy only returns summary fields; this fetches that summary
+        list first to discover every policy ID, then requests full details
+        (GET /policy/{id}) for each one, so each entry in the returned list
+        is a complete policy configuration rather than just its name/status.
+        """
+        return [
+            self.get_scan_policy_details(policy["id"])
+            for policy in self.get_scan_policies()
+        ]
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -123,14 +178,14 @@ def main() -> None:
         verify_ssl=verify_ssl,
     )
 
-    print(f"Collecting scan instances from {host} ...")
-    scan_instances = client.get_scan_instances()
+    print(f"Collecting scan policy configurations from {host} ...")
+    scan_policies = client.collect_scan_policy_configs()
 
-    output_path = "scan_instances.json"
+    output_path = "scan_policies.json"
     with open(output_path, "w", encoding="utf-8") as fh:
-        json.dump(scan_instances, fh, indent=2, default=str)
+        json.dump(scan_policies, fh, indent=2, default=str)
 
-    print(f"  {len(scan_instances)} scan instance(s) found")
+    print(f"  {len(scan_policies)} scan policy configuration(s) found")
     print(f"\nReport written to {output_path}")
 
 
