@@ -152,25 +152,29 @@ class SecurityCenterClient:
         (GET /policy/{id}) for each one, so each entry in the returned list
         is a complete policy configuration rather than just its name/status.
 
-        If a given policy's details call fails (e.g. a permissions error on
-        one policy), that one entry becomes {"id", "name", "error"} and
-        collection continues — one bad policy should not discard every other
-        policy's configuration that was already retrieved.
+        If a given policy's details call fails (e.g. a permissions error, or
+        a malformed summary missing/with a non-numeric "id"), that one entry
+        becomes {"id", "name", "error"} and collection continues — one bad
+        policy should not discard every other policy's configuration that
+        was already retrieved.
         """
         configs: list[dict[str, Any]] = []
 
         for policy in self.get_scan_policies():
+            policy_id = policy.get("id")
             try:
-                configs.append(self.get_scan_policy_details(policy["id"]))
-                print(f"  [ok]  policy {policy['id']} ({policy.get('name')})")
-            except RestflyException as exc:
+                if policy_id is None:
+                    raise ValueError("policy summary is missing an 'id' field")
+                configs.append(self.get_scan_policy_details(policy_id))
+                print(f"  [ok]  policy {policy_id} ({policy.get('name')})")
+            except (RestflyException, ValueError, TypeError) as exc:
                 configs.append({
-                    "id":    policy.get("id"),
+                    "id":    policy_id,
                     "name":  policy.get("name"),
                     "error": str(exc),
                 })
                 print(
-                    f"  [err] policy {policy.get('id')} ({policy.get('name')}): {exc}",
+                    f"  [err] policy {policy_id} ({policy.get('name')}): {exc}",
                     file=sys.stderr,
                 )
 
@@ -191,19 +195,25 @@ def main() -> None:
             "Copy .env.example to .env and fill in your credentials."
         )
 
-    client = SecurityCenterClient(
-        host=host,
-        access_key=access_key,
-        secret_key=secret_key,
-        verify_ssl=verify_ssl,
-    )
+    try:
+        client = SecurityCenterClient(
+            host=host,
+            access_key=access_key,
+            secret_key=secret_key,
+            verify_ssl=verify_ssl,
+        )
 
-    print(f"Collecting scan policy configurations from {host} ...")
-    scan_policies = client.collect_scan_policy_configs()
+        print(f"Collecting scan policy configurations from {host} ...")
+        scan_policies = client.collect_scan_policy_configs()
+    except RestflyException as exc:
+        sys.exit(f"Error: failed to communicate with Security Center: {exc}")
 
     output_path = "scan_policies.json"
-    with open(output_path, "w", encoding="utf-8") as fh:
-        json.dump(scan_policies, fh, indent=2, default=str)
+    try:
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(scan_policies, fh, indent=2, default=str)
+    except OSError as exc:
+        sys.exit(f"Error: failed to write {output_path}: {exc}")
 
     print(f"  {len(scan_policies)} scan policy configuration(s) found")
     print(f"\nReport written to {output_path}")

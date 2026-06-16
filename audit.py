@@ -72,6 +72,7 @@ from pathlib import Path
 from typing import Any
 
 import colorama
+import defusedxml.ElementTree as DET
 from deepdiff import DeepDiff
 
 colorama.init()
@@ -158,17 +159,26 @@ def xml_to_dict(xml_path: str | Path, infer_types: bool = False) -> dict[str, An
     top-level keys — so <ScanPolicy><name>...</name></ScanPolicy>
     produces {"name": ...} rather than {"ScanPolicy": {"name": ...}}.
 
+    Parsing uses defusedxml rather than the stdlib xml.etree.ElementTree
+    directly: stock ElementTree does not guard against entity-expansion
+    ("billion laughs") or quadratic-blowup XML denial-of-service payloads.
+    The golden file is meant to be hand-authored and trusted, but rejecting
+    DTDs/entities outright costs nothing and removes the risk if a golden
+    file is ever sourced from somewhere less trusted (e.g. fetched by CI).
+
     Raises:
         FileNotFoundError if xml_path does not exist.
         ET.ParseError on malformed XML.
-        ValueError if the root element has no children to convert.
+        ValueError if the XML contains a DTD/entity/external reference
+            (rejected by defusedxml), or if the root element has no
+            children to convert.
     """
     path = Path(xml_path)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {path}")
 
     try:
-        tree = ET.parse(path)
+        tree = DET.parse(path)
     except ET.ParseError as exc:
         raise ET.ParseError(f"Malformed XML in {path}: {exc}") from exc
 
@@ -438,7 +448,10 @@ def main() -> None:
     current_label = args.current or "<stdin>"
     print_diff(diff, args.golden, current_label, use_color=not args.no_color)
 
-    write_diff(diff, args.out)
+    try:
+        write_diff(diff, args.out)
+    except OSError as exc:
+        sys.exit(f"Error: failed to write {args.out}: {exc}")
     print(f"\nFull report written to {args.out}")
 
     sys.exit(1 if diff else 0)
