@@ -1,25 +1,37 @@
-# Tenable Security Center Audit Tools
+# Tenable Security Center Scan Policy Auditor
 
-A Python toolkit for querying a Tenable Security Center (SC) instance via its REST API and auditing its configuration against a known-good baseline.
+A small Python toolkit that pulls scan policy configurations out of a
+Tenable Security Center (SC) instance via [pyTenable](https://pytenable.readthedocs.io/)
+and audits them against a hand-authored "golden copy" baseline using
+[DeepDiff](https://zepworks.com/deepdiff/).
+
+## What this actually does
+
+Security Center has three distinct, easily-confused object types:
+
+| Object | Endpoint | What it is |
+|---|---|---|
+| **Scan policy** | `/rest/policy` | A reusable template of scan settings — preferences, plugin family selection, audit files. No targets, no schedule. |
+| Scan | `/rest/scan` | A configured scan: a policy plus targets, a schedule, a repository, a zone. |
+| Scan result | `/rest/scanResult` | One executed run of a scan: status, start/finish time, IP/check counts. |
+
+This toolkit works exclusively with **scan policies** (the first row). It
+does not touch scan definitions or scan results.
 
 ## Contents
 
 | File | Purpose |
 |---|---|
-| `tenable_sc.py` | SC API client — authentication, pagination, data collection |
-| `audit.py` | Auditor — compares live config to a YAML baseline, checks scan zone scope |
-| `xml_to_baseline.py` | Converter — turns an XML SC config export into a baseline YAML |
-| `audit_baseline.yaml` | Example baseline (edit before use) |
-| `sample_config.xml` | Example XML input for `xml_to_baseline.py` |
-
----
+| [tenable_sc.py](tenable_sc.py) | Pulls every scan policy's full configuration from SC and writes it to JSON |
+| [audit.py](audit.py) | Diffs one live scan policy (JSON) against a golden-copy baseline (XML) |
+| [golden_scan_policy.xml](golden_scan_policy.xml) | Example golden-copy baseline, for use with `audit.py` |
+| [sample_scan_policy.json](sample_scan_policy.json) | Example live policy JSON, for testing `audit.py` without a live SC instance |
 
 ## Requirements
 
 - Python 3.10+
 - Tenable Security Center 5.13+ (API key authentication)
-
----
+- An API key pair with permission to read scan policies
 
 ## Installation
 
@@ -41,7 +53,16 @@ copy .env.example .env
 # Edit .env and fill in SC_HOST, SC_ACCESS_KEY, SC_SECRET_KEY
 ```
 
-**.env** (never commit this file):
+**requirements.txt:**
+
+```
+pytenable>=26.6
+python-dotenv>=1.0
+deepdiff>=9.1
+colorama>=0.4
+```
+
+**.env** (copied from `.env.example`; never commit this file):
 
 ```ini
 SC_HOST=securitycenter.example.com
@@ -50,229 +71,162 @@ SC_SECRET_KEY=your-secret-key-here
 SC_VERIFY_SSL=false   # set to true in production
 ```
 
-API keys are generated in SC under **System > Users > [user] > API Keys**.
+API keys are generated in SC under **Users > Your Profile > API Keys >
+Generate**.
 
----
-
-## Workflow overview
+## Workflow
 
 ```
-XML export  ──►  xml_to_baseline.py  ──►  baseline.yaml
-                                               │
-                                               ▼
-                               audit.py  ──►  report (stdout + JSON)
+tenable_sc.py  ──►  scan_policies.json  ──►  audit.py  ──►  stdout report + audit_report.json
+                                              ▲
+                              golden_scan_policy.xml (hand-authored once)
 ```
 
-### Step 1 — Build a baseline from an XML export
-
-Export the SC configuration as XML (or use `sample_config.xml` to test), then convert it:
+### Step 1 — Pull live scan policy configurations
 
 ```bash
-python xml_to_baseline.py sample_config.xml
-# Output: sample_config_baseline.yaml
+python tenable_sc.py
 ```
 
-Specify an output path or description:
+This authenticates to SC, calls `GET /policy` to enumerate every configured
+scan policy, then calls `GET /policy/{id}` for each one to get its full
+configuration (preferences, audit files, and — for Advanced Scan/Audit
+templates — plugin family selections). The list endpoint alone only
+returns summary fields (name, description, status, ...), so this extra
+per-policy call is required to get anything worth auditing.
+
+Output:
+
+```
+Collecting scan policy configurations from securitycenter.example.com ...
+  [ok]  policy 5 (PCI Quarterly)
+  [ok]  policy 7 (CIS Hardening Baseline)
+  [err] policy 9 (Legacy Audit): 403 Forbidden ...
+  3 scan policy configuration(s) found
+
+Report written to scan_policies.json
+```
+
+`scan_policies.json` is a JSON array, one entry per policy. If a given
+policy's details call fails (e.g. a permissions error), that one entry
+becomes `{"id", "name", "error"}` instead of aborting the whole run — every
+other policy's configuration is still written out.
+
+### Step 2 — Author a golden-copy baseline (once, by hand)
+
+There is no converter that generates this for you — write an XML file
+describing what a policy's configuration *should* look like. See
+[golden_scan_policy.xml](golden_scan_policy.xml) for a complete example.
+
+Rules `audit.py` applies when parsing this file:
+
+- Nested elements become nested dict keys.
+- Repeated sibling elements with the **same tag** collapse into a list —
+  with no wrapper element, e.g.:
+  ```xml
+  <auditFiles><id>10</id><name>CIS_Windows_2019_Level1</name></auditFiles>
+  <auditFiles><id>11</id><name>CIS_RHEL8_Level1</name></auditFiles>
+  ```
+  becomes `"auditFiles": [{"id": "10", ...}, {"id": "11", ...}]`, matching
+  the shape SC's API actually returns.
+- Leaf text is compared as a **plain string** by default — `<status>0</status>`
+  becomes `"0"`, not `0` — because the SC REST API returns nearly every
+  field as a string, even numeric and boolean ones. Coercing types here
+  would manufacture false discrepancies against that live data. Pass
+  `--infer-types` to opt into bool/int/float coercion if your use case
+  needs it.
+- Empty elements (`<context></context>`) become `""`, not `null` — SC
+  returns unset string fields as empty strings, not JSON `null`.
+- Element attributes are ignored; only nested elements and text are read.
+
+### Step 3 — Audit a live policy against the baseline
 
 ```bash
-python xml_to_baseline.py export.xml --out prod_baseline.yaml --description "Q3 2026 baseline"
+# Compare against a single saved policy JSON file
+python audit.py --golden golden_scan_policy.xml --current scan_policy.json
+
+# Pick one entry out of the array tenable_sc.py just wrote
+python audit.py --golden golden_scan_policy.xml --current scan_policies.json --index 0
+
+# Pipe straight from tenable_sc.py's output without an intermediate file
+type scan_policies.json | python audit.py --golden golden_scan_policy.xml --index 0
 ```
 
-Exclude fields you do not want to check:
+Try it now with the bundled samples (no live SC instance needed):
 
 ```bash
-python xml_to_baseline.py export.xml --exclude smtpHost,smtpFromAddress,ldapHost
+python audit.py --golden golden_scan_policy.xml --current sample_scan_policy.json --index 0
 ```
 
-The converter writes exact-match checks for every field it finds. **Numeric fields default to exact match.** To express a range, open the YAML and replace `expected` with `min`, `max`, or both:
+#### Output
 
-```yaml
-# Exact match (generated default)
-config.sessionTimeout:
-  type: numeric
-  expected: 30
+stdout gets a color-coded, `+`/`-` marked report, from the point of view of
+the live (non-golden) copy:
 
-# Range check (manually edited)
-config.sessionTimeout:
-  type: numeric
-  min: 15
-  max: 60
-
-# One-sided — value must not exceed 72 hours (259200 seconds)
-status.scanCompletionTime:
-  type: numeric
-  max: 259200
-```
-
-### Step 2 — Add the scope block
-
-The converter does not generate a `scope` block; add it manually. The scope defines the authorised scanning boundary used by the scope audit:
-
-```yaml
-scope:
-  cidrs:
-    - "192.168.0.0/16"     # Corporate LAN — must be covered by a scan zone
-    - "10.10.0.0/24"       # DMZ segment
-  ips:
-    - "192.168.1.50"       # Management host that must always be scanned
-  hostnames:
-    - "server01.corp.example.com"   # Flagged for manual DNS verification
-```
-
-### Step 3 — Run the audit
-
-```bash
-python audit.py
-# Uses audit_baseline.yaml and writes audit_report.json by default
-```
-
-Custom paths:
-
-```bash
-python audit.py --baseline prod_baseline.yaml --out reports/2026-Q3.json
-```
-
-The script prints a summary to stdout and exits with:
-- **0** — all checks passed, no scope issues
-- **1** — one or more failures or scope issues found
-
----
-
-## Baseline YAML reference
-
-```yaml
-version: "1.0"
-description: "Production SC security baseline"
-
-config_checks:
-
-  # String check — exact case-sensitive match
-  system_info.licenseStatus:
-    type: string
-    expected: "Valid"
-
-  # Boolean check
-  config.ldapEnabled:
-    type: boolean
-    expected: true
-
-  # Numeric — exact match
-  config.smtpPort:
-    type: numeric
-    expected: 25
-
-  # Numeric — range (both bounds inclusive; omit either for one-sided)
-  config.sessionTimeout:
-    type: numeric
-    min: 15
-    max: 60
-
-scope:
-  cidrs:
-    - "192.168.0.0/16"
-  ips:
-    - "10.10.0.100"
-  hostnames:
-    - "server01.corp.example.com"
-```
-
-**Baseline key format:** `"section.field"` where `section` matches a key returned by `collect_config_report()`:
-
-| Section key | SC API source |
-|---|---|
-| `config` | `/rest/config` |
-| `system_info` | `/rest/system` |
-| `status` | `/rest/status` |
-| `current_user` | `/rest/currentUser` |
-| `ip_info` | `/rest/ipInfo` |
-| `scanners` | `/rest/scanner` |
-| `repositories` | `/rest/repository` |
-| `scan_zones` | `/rest/zone` |
-| `organizations` | `/rest/organization` |
-
----
-
-## XML input format
-
-Two styles are accepted and may be mixed in the same file.
-
-**Nested sections** (preferred):
-
-```xml
-<SecurityCenterConfig host="sc.example.com" exported="2026-05-26T00:00:00Z">
-  <config>
-    <sessionTimeout>30</sessionTimeout>
-    <ldapEnabled>true</ldapEnabled>
-  </config>
-  <system_info>
-    <licenseStatus>Valid</licenseStatus>
-  </system_info>
-</SecurityCenterConfig>
-```
-
-**Flat `<Setting>` attributes:**
-
-```xml
-<Settings>
-  <Setting name="sessionTimeout" value="30"    section="config"/>
-  <Setting name="ldapEnabled"    value="true"  section="config"/>
-  <Setting name="licenseStatus"  value="Valid" section="system_info"/>
-</Settings>
-```
-
-The `section` attribute defaults to `"config"` when omitted. If the same key appears in both styles, the nested-section value takes precedence.
-
----
-
-## Example audit output
+- `+` (green) — present in the live config but not the golden baseline (an addition)
+- `-` (red) — present in the golden baseline but not the live config (a removal)
+- A changed value prints both lines together, so a drifted field reads like
+  a tiny unified diff
 
 ```
-==============================================================
-  Security Center Audit Report
-  Host      : securitycenter.example.com
-  Timestamp : 2026-05-26T14:32:01+00:00
-==============================================================
+================================================================
+  Scan Policy Configuration Audit
+  Golden (baseline) : golden_scan_policy.xml
+  Current (live)    : sample_scan_policy.json
+================================================================
 
-CONFIG CHECKS
---------------------------------------------------------------
-  [PASS]  system_info.licenseStatus
-  [PASS]  config.smtpEncryption
-  [PASS]  config.ldapEnabled
-  [FAIL]  config.sessionTimeout
-            expected : 15.0-60.0
-            actual   : 120.0
-            detail   : 120.0 is outside [15.0-60.0]
-  [PASS]  status.feedStatus
+  + root['id']: '7'
+  - root['auditFiles'][1]: {'id': '11', 'name': 'CIS_RHEL8_Level1'}
+  - root['preferences']['thorough_tests']: 'no'
+  + root['preferences']['thorough_tests']: 'yes'
+  - root['families'][1]['state']: 'disabled'
+  + root['families'][1]['state']: 'enabled'
 
-  Result: 4 passed  |  1 failed  |  0 skipped
-
-SCOPE CHECKS
---------------------------------------------------------------
-  Uncovered scope entries  (1 issue(s)):
-    [FAIL]  172.16.50.0/24
-              172.16.50.0/24 has no overlap with any scan zone — hosts in this range will never be scanned
-
-==============================================================
-  RESULT: FAIL — 2 issue(s) require attention
-==============================================================
+================================================================
+  RESULT: FAIL - 4 discrepancy(ies) found
+================================================================
 
 Full report written to audit_report.json
 ```
 
----
+The same discrepancies are also written as structured JSON (via
+`DeepDiff.to_json()`, no color codes) to the path given by `--out` (default
+`audit_report.json`) for programmatic consumption.
+
+Exit codes: `0` no discrepancies, `1` discrepancies found (or a bad input —
+see stderr for the message).
+
+#### Useful flags
+
+| Flag | Effect |
+|---|---|
+| `--index N` / `-i N` | Select policy N when `--current` (or stdin) is a JSON array |
+| `--out PATH` / `-o` | Where to write the structured JSON diff report (default `audit_report.json`) |
+| `--exclude-path PATH` / `-e` | Exclude a DeepDiff path from comparison, e.g. `--exclude-path "root['modifiedTime']"`. Repeatable. |
+| `--strict-order` | Treat list element order as significant (default: ignored) |
+| `--infer-types` | Coerce golden XML leaf text to bool/int/float instead of comparing as strings |
+| `--no-color` | Disable ANSI color in the stdout report |
 
 ## Extending
 
-**Add a new config check** — add an entry to `config_checks` in the baseline YAML. No code changes needed.
+**Pull additional SC objects** — pyTenable exposes one namespace per SC API
+object on the `TenableSC` instance (`sc.policies`, `sc.scans`,
+`sc.scan_instances`, `sc.repositories`, `sc.scan_zones`, `sc.organizations`,
+`sc.credentials`, ...). Add a method to `SecurityCenterClient` in
+[tenable_sc.py](tenable_sc.py) that calls the relevant namespace and shapes
+the result the way callers need — pagination, auth, and retries are
+already handled by pyTenable.
 
-**Add a new API section** — implement a method on `SecurityCenterClient` in `tenable_sc.py` and register it in `collect_config_report()`. The new section key becomes available immediately as a baseline prefix.
-
-**Add a new check type** — add a branch in `SecurityCenterAuditor._check_field()` in `audit.py` and define the new spec keys in the baseline.
-
----
+**Adjust the comparison** — `compare_configs()` in [audit.py](audit.py)
+threads `ignore_order`/`exclude_paths` through to `DeepDiff`; other DeepDiff
+options (`significant_digits`, `exclude_regex_paths`, etc.) can be added
+the same way.
 
 ## Security notes
 
-- Credentials are read exclusively from `.env` which is listed in `.gitignore`. Never commit real credentials.
-- Set `SC_VERIFY_SSL=true` in production environments. The `false` default is for lab/test use only.
-- API keys should be scoped to a read-only SC role where possible. `audit.py` and `tenable_sc.py` perform only GET requests (no writes) except for the file upload helpers which are unused by the audit workflow.
+- Credentials are read exclusively from `.env`, which is listed in
+  `.gitignore`. Never commit real credentials.
+- Set `SC_VERIFY_SSL=true` in production environments. The `false` default
+  in `.env.example` is for lab/test use only.
+- Both scripts only perform read (`GET`) requests against the SC API — an
+  API key scoped to a read-only role is sufficient.
