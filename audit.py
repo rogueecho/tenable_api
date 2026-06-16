@@ -22,12 +22,16 @@ Inputs
              against that live data.
 
   current  – the live configuration of a single scan policy as JSON, i.e.
-             one entry from the list returned by
+             one entry from the "scan_policies" list returned by
              tenable_sc.SecurityCenterClient.collect_scan_policy_configs().
              Read from a file (--current) or from stdin (pipe it straight
-             out of tenable_sc.py).  If the JSON is an array of policies
-             rather than a single object, --index selects which entry to
-             audit.
+             out of tenable_sc.py).  Three input shapes are accepted: a
+             single policy object, a bare list of them, or the combined
+             blob tenable_sc.py's main() writes to scan_policies.json
+             ({"scan_policies": [...], "assets": [...]}) — the "assets"
+             key is ignored here.  If a list of policies is in play
+             (either bare or unwrapped from the blob), --index selects
+             which entry to audit.
 
 Comparison
 ----------
@@ -208,10 +212,19 @@ def _load_json_file(path: str | Path) -> Any:
 def _select_scan_policy(data: Any, index: int | None) -> dict[str, Any]:
     """Normalise loaded JSON into a single scan policy dict.
 
-    Accepts either a single scan policy object, or a list of them (as
-    produced by tenable_sc.SecurityCenterClient.collect_scan_policy_configs()),
-    in which case `index` selects which entry to use.
+    Accepts any of:
+      - a single scan policy object
+      - a list of them (as produced by
+        tenable_sc.SecurityCenterClient.collect_scan_policy_configs())
+      - the combined blob tenable_sc.py's main() writes to scan_policies.json:
+        {"scan_policies": [...], "assets": [...]} — unwrapped to the
+        "scan_policies" list before the rest of this function runs, so this
+        dict is never mistaken for a single policy object itself.
+    `index` selects which entry to use once a list is in hand.
     """
+    if isinstance(data, dict) and "scan_policies" in data:
+        data = data["scan_policies"]
+
     if isinstance(data, dict):
         return data
 
@@ -400,8 +413,9 @@ def main() -> None:
     parser.add_argument(
         "--index", "-i", type=int, default=None,
         help=(
-            "If --current (or stdin) is a JSON array of scan policies "
-            "(e.g. scan_policies.json), select this zero-based index."
+            "If --current (or stdin) contains multiple scan policies — a "
+            "bare list, or scan_policies.json's {\"scan_policies\": [...], "
+            "\"assets\": [...]} blob — select this zero-based index."
         ),
     )
     parser.add_argument(
