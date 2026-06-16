@@ -1,0 +1,34 @@
+[
+  {
+    "id": "7",
+    "name": "CIS Hardening Baseline",
+    "description": "Advanced policy auditing hosts against CIS benchmarks",
+    "status": "0",
+    "type": "policy",
+    "context": "",
+    "generateXCCDFResults": "false",
+    "policyTemplate": {
+      "id": "1",
+      "name": "Advanced Scan"
+    },
+    "targetGroup": {
+      "id": "0",
+      "name": ""
+    },
+    "preferences": {
+      "max_checks_per_host": "5",
+      "max_hosts_per_scan": "30",
+      "safe_checks": "yes",
+      "thorough_tests": "yes",
+      "report_paranoia": "Normal",
+      "silent_dependencies": "yes"
+    },
+    "auditFiles": [
+      { "id": "10", "name": "CIS_Windows_2019_Level1" }
+    ],
+    "families": [
+      { "id": "20", "name": "Windows", "type": "normal", "state": "enabled", "count": "512" },
+      { "id": "21", "name": "Denial of Service", "type": "normal", "state": "enabled", "count": "87" }
+    ]
+  }
+]

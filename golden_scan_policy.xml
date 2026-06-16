@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  golden_scan_policy.xml
+  Example golden-copy baseline for a single Security Center SCAN POLICY
+  (GET /policy/{id}), for use with audit.py.
+
+  A scan policy is a reusable template of scan settings — preferences,
+  audit files, plugin family selection.  It has no targets and no
+  schedule; those belong to a "scan" (a separate /rest/scan object that
+  references a policy).  See the module docstring in tenable_sc.py for the
+  full policy vs. scan vs. scan result distinction.
+
+  Structure: nested elements map to nested dict keys.  Repeated sibling
+  tags with the same name collapse into a list, so auditFiles and families
+  below (which repeat the same tag directly, with no wrapper element) are
+  read back as JSON arrays — matching the shape returned by
+  tenable_sc.SecurityCenterClient.collect_scan_policy_configs().  Leaf text
+  is compared as a plain string by default because the SC REST API returns
+  nearly every field as a string, even numeric and boolean ones.
+-->
+<ScanPolicy>
+  <name>CIS Hardening Baseline</name>
+  <description>Advanced policy auditing hosts against CIS benchmarks</description>
+  <status>0</status>
+  <type>policy</type>
+  <context></context>
+  <generateXCCDFResults>false</generateXCCDFResults>
+  <policyTemplate>
+    <id>1</id>
+    <name>Advanced Scan</name>
+  </policyTemplate>
+  <targetGroup>
+    <id>0</id>
+    <name></name>
+  </targetGroup>
+
+  <preferences>
+    <max_checks_per_host>5</max_checks_per_host>
+    <max_hosts_per_scan>30</max_hosts_per_scan>
+    <safe_checks>yes</safe_checks>
+    <thorough_tests>no</thorough_tests>
+    <report_paranoia>Normal</report_paranoia>
+    <silent_dependencies>yes</silent_dependencies>
+  </preferences>
+
+  <auditFiles>
+    <id>10</id>
+    <name>CIS_Windows_2019_Level1</name>
+  </auditFiles>
+  <auditFiles>
+    <id>11</id>
+    <name>CIS_RHEL8_Level1</name>
+  </auditFiles>
+
+  <families>
+    <id>20</id>
+    <name>Windows</name>
+    <type>normal</type>
+    <state>enabled</state>
+    <count>512</count>
+  </families>
+  <families>
+    <id>21</id>
+    <name>Denial of Service</name>
+    <type>normal</type>
+    <state>disabled</state>
+    <count>87</count>
+  </families>
+</ScanPolicy>
