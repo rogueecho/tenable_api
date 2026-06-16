@@ -70,6 +70,7 @@ import sys
 from typing import Any
 
 from dotenv import load_dotenv
+from tenable.errors import RestflyException
 from tenable.sc import TenableSC
 
 # ── Initialisation ────────────────────────────────────────────────────────────
@@ -150,11 +151,30 @@ class SecurityCenterClient:
         list first to discover every policy ID, then requests full details
         (GET /policy/{id}) for each one, so each entry in the returned list
         is a complete policy configuration rather than just its name/status.
+
+        If a given policy's details call fails (e.g. a permissions error on
+        one policy), that one entry becomes {"id", "name", "error"} and
+        collection continues — one bad policy should not discard every other
+        policy's configuration that was already retrieved.
         """
-        return [
-            self.get_scan_policy_details(policy["id"])
-            for policy in self.get_scan_policies()
-        ]
+        configs: list[dict[str, Any]] = []
+
+        for policy in self.get_scan_policies():
+            try:
+                configs.append(self.get_scan_policy_details(policy["id"]))
+                print(f"  [ok]  policy {policy['id']} ({policy.get('name')})")
+            except RestflyException as exc:
+                configs.append({
+                    "id":    policy.get("id"),
+                    "name":  policy.get("name"),
+                    "error": str(exc),
+                })
+                print(
+                    f"  [err] policy {policy.get('id')} ({policy.get('name')}): {exc}",
+                    file=sys.stderr,
+                )
+
+        return configs
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
