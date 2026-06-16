@@ -43,6 +43,20 @@ IPs / CIDRs : a permissive regex finds *candidate* tokens (anything
               IPv4-in-IPv6 notation (e.g. "::ffff:192.0.2.1") is not
               matched.
 
+              Routing table output is explicitly handled: Palo Alto
+              ("show routing route") and Juniper ("show route" / "set
+              routing-options static route") already use CIDR slash
+              notation throughout, so the candidate regex above is enough.
+              Classic Cisco/ASA syntax instead writes a range as two
+              adjacent tokens -- "<network> <netmask>" in static routes
+              and "show route" output (e.g. "10.0.0.0 255.0.0.0"), or
+              "<network> <wildcard-mask>" in OSPF/EIGRP "network"
+              statements and ACLs (e.g. "10.0.0.0 0.255.255.255").  Both
+              forms are recognised and converted to the equivalent CIDR by
+              _consume_network_mask_pairs() before the plain candidate
+              pass runs, so the mask token itself never leaks into the
+              output as a bogus standalone "IP".
+
 Hostnames   : a label-based regex requires the final label ("TLD") to be
               2+ purely-alphabetic characters not in a file-extension
               blocklist (see DEFAULT_EXCLUDED_TLDS).  This single rule is
@@ -180,9 +194,82 @@ def iter_input_files(paths: list[Path], recursive: bool) -> Iterator[Path]:
 # ip_network() below is what actually decides validity, so there's no need
 # (or attempt) to encode "0-255 per octet" or full IPv6 grammar in regex.
 _IPV4_CANDIDATE_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?\b")
+# Boundary assertions exclude word chars and ":" (things that could extend
+# a real hex-group-or-colon run) but deliberately NOT ".": the consuming
+# pattern never contains a literal "." anyway, so excluding it from the
+# boundary check buys no protection -- it only ever caused a real bug,
+# where a CIDR range immediately followed by sentence punctuation (e.g.
+# "...covers 2001:db8::/32." at the end of a sentence) had its "/32"
+# silently dropped because the lookahead failed right after the prefix
+# length and the optional CIDR group backtracked away.
 _IPV6_CANDIDATE_RE = re.compile(
-    r"(?<![\w:.])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?:/\d{1,3})?(?![\w:.])"
+    r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?:/\d{1,3})?(?![\w:])"
 )
+
+# Classic Cisco/ASA routing syntax expresses a range as two adjacent IPv4
+# tokens — "<network> <netmask>" in static routes and "show route"/"show
+# running-config" output (e.g. "10.0.0.0 255.0.0.0"), or "<network>
+# <wildcard-mask>" (the bitwise inverse of a netmask) in OSPF/EIGRP
+# "network" statements and ACLs (e.g. "10.0.0.0 0.255.255.255").  Palo Alto
+# and Juniper output, by contrast, already uses CIDR slash notation
+# end-to-end, so it's handled by the plain candidate regexes above with no
+# extra work.  Build {dotted-quad mask string: prefix length} lookups for
+# every /0-/32 netmask and its wildcard counterpart so both forms convert
+# to the equivalent CIDR.
+def _build_netmask_tables() -> tuple[dict[str, int], dict[str, int]]:
+    netmasks: dict[str, int] = {}
+    wildcards: dict[str, int] = {}
+    for prefix in range(0, 33):
+        net = ipaddress.IPv4Network(f"0.0.0.0/{prefix}")
+        netmasks[str(net.netmask)] = prefix
+        wildcards[str(net.hostmask)] = prefix
+    return netmasks, wildcards
+
+
+_NETMASK_TO_PREFIX, _WILDCARD_TO_PREFIX = _build_netmask_tables()
+
+_NETWORK_MASK_PAIR_RE = re.compile(
+    r"\b(\d{1,3}(?:\.\d{1,3}){3})[ \t]+(\d{1,3}(?:\.\d{1,3}){3})\b"
+)
+
+
+def _consume_network_mask_pairs(text: str) -> tuple[set[str], str]:
+    """Find "<network> <mask>" pairs and convert each to CIDR.
+
+    Only pairs whose second token is an exact /0-/32 netmask or wildcard
+    mask are converted (e.g. a coincidental "192.168.1.1 192.168.1.2"
+    elsewhere in the text is untouched — neither token is a valid mask, so
+    the regex match is returned as-is).  Matched pairs are blanked out
+    (replaced with equal-length whitespace, so positions/line numbers
+    elsewhere are unaffected) so the mask token doesn't also get picked up
+    as a bogus standalone "IP" by the plain candidate pass that follows.
+
+    Only matches within a single line (uses [ \\t]+, not \\s+) so a mask at
+    the end of one line is never paired with an unrelated address that
+    happens to start the next line.
+
+    Returns:
+        (cidrs found, text with matched pairs blanked out).
+    """
+    cidrs: set[str] = set()
+
+    def _replace(m: re.Match) -> str:
+        network_str, mask_str = m.group(1), m.group(2)
+        prefix = _NETMASK_TO_PREFIX.get(mask_str)
+        if prefix is None:
+            prefix = _WILDCARD_TO_PREFIX.get(mask_str)
+        if prefix is None:
+            return m.group(0)  # second token isn't a real mask — leave as-is
+
+        try:
+            network = ipaddress.ip_network(f"{network_str}/{prefix}", strict=False)
+        except ValueError:
+            return m.group(0)
+
+        cidrs.add(str(network))
+        return " " * len(m.group(0))
+
+    return cidrs, _NETWORK_MASK_PAIR_RE.sub(_replace, text)
 
 
 def extract_ip_tokens(text: str) -> tuple[set[str], set[str]]:
@@ -193,7 +280,8 @@ def extract_ip_tokens(text: str) -> tuple[set[str], set[str]]:
         callers/output can list them under distinct headings.
     """
     ips: set[str] = set()
-    cidrs: set[str] = set()
+
+    cidrs, text = _consume_network_mask_pairs(text)
 
     candidates = _IPV4_CANDIDATE_RE.findall(text) + _IPV6_CANDIDATE_RE.findall(text)
     for candidate in candidates:
